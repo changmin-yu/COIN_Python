@@ -1,6 +1,6 @@
 Python implementation of the COIN (COntextual INference) model [[1](#references)]. The original MATLAB implementation can be found [here](https://github.com/jamesheald/COIN).
 
-I wish to thank James Heald for his help in reproducing his codes. All mistakes are mine and mine only. Please contact me at changmin.yu98[at]gmail.com.
+I wish to thank James Heald for his help in reproducing his codes. All mistakes are mine and mine only. Please contact me at changmin.yu98[at]gmail.com if you have question about the implementation.
 
 ### References
 

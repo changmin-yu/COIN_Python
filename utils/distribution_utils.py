@@ -95,6 +95,7 @@ def stationary_distribution(transmat: np.ndarray):
     A = transmat.T - np.eye(c)
     b = np.zeros((c, ))
     
+    # add normalisation constraint to ensure proper probability distribution
     A = np.concatenate([A, np.ones((1, c))], axis=0)
     b = np.concatenate([b, np.array([1.])], axis=0)
     
@@ -206,8 +207,6 @@ def ntail(l: np.ndarray, u: np.ndarray):
 
 
 def tn(l: np.ndarray, u: np.ndarray):
-    # sample from standard normal distribution, truncated over the region [l, u]
-    # where -a < l < u < a
     tolerance = 2
     inds = (np.abs(u - l) > tolerance)
     x = l.copy()
@@ -218,7 +217,7 @@ def tn(l: np.ndarray, u: np.ndarray):
         tu = u[inds]
         x[inds] = trnd(tl, tu)
     
-    # case: abs(u - l) < tolerance, use inverse-transform
+    # case: abs(u - l) < tolerance, use cumulative normal inverse-transform
     inds = ~inds
     if np.any(inds):
         tl = l[inds]

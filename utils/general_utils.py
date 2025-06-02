@@ -76,6 +76,7 @@ def stirling_number(
     log_max_stirling_number: List[int] = [0], 
 ) -> np.ndarray:
     # compute the unsigned stirling numbers of the first kind
+    # counting the number of permutations of n elements with k disjoint cycles
     
     if n > max_n:
         for i in range(max_n, n):
@@ -155,6 +156,38 @@ def systematic_resampling(weights: np.ndarray):
     
     return p
 
+
+def check_cue_labels(cues: np.ndarray, perturbations: np.ndarray):
+    assert perturbations is not None
+    
+    num_trials = len(perturbations)
+        
+    for i in range(num_trials):
+        if i == 0:
+            if cues[i] != 1:
+                cues = renumber_cues()
+                break
+        else:
+            if (cues[i] not in cues[:i]) and (cues[i] != np.max(cues[:i])+1):
+                cues = renumber_cues(cues)
+                break
+    
+    return cues
+
+
+def renumber_cues(cues: np.ndarray):
+    unique_cues, inds = np.unique(cues, return_index=True)
+    unique_cues = unique_cues[np.argsort(inds)]
+    
+    if cues.ndim == 1:
+        cues = np.array([np.where(unique_cues == cue)[0][0]+1 for cue in cues])
+    else:
+        cues = np.array([[np.where(unique_cues == cue)[0][0]+1 for cue in row] for row in cues])
+    
+    print("Cues have been numbered according to the order they were presented in the experiments.")
+    
+    return cues
+    
 
 if __name__=="__main__":
     n = 10

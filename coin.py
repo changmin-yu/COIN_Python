@@ -42,6 +42,7 @@ from utils.general_utils import (
     per_slice_multiply, 
     log_sum_exp, 
     systematic_resampling, 
+    check_cue_labels,
 )
 from utils.distribution_utils import (
     random_dirichlet, 
@@ -186,19 +187,19 @@ class COIN:
         # figure directory
         fig_dir: Optional[str] = None, 
     ):
-        self.sigma_process_noise = sigma_process_noise
-        self.sigma_sensory_noise = sigma_sensory_noise
+        self.sigma_process_noise = sigma_process_noise # sigma_q (eq. 3)
+        self.sigma_sensory_noise = sigma_sensory_noise # sigma_r (eq. 5)
         self.sigma_motor_noise = sigma_motor_noise
-        self.prior_mean_retention = prior_mean_retention
-        self.prior_precision_retention = prior_precision_retention
-        self.prior_precision_drift = prior_precision_drift
-        self.gamma_context = gamma_context
-        self.alpha_context = alpha_context
-        self.rho_context = rho_context
-        self.gamma_cue = gamma_cue
-        self.alpha_cue = alpha_cue
+        self.prior_mean_retention = prior_mean_retention # mu_a (eq. 10)
+        self.prior_precision_retention = prior_precision_retention # 1/sigma_a^2 (eq. 10)
+        self.prior_precision_drift = prior_precision_drift # 1 / sigma_d^2 (eq. 10)
+        self.gamma_context = gamma_context # gamma (eq. 7)
+        self.alpha_context = alpha_context # alpha (eq. 8)
+        self.rho_context = rho_context # self-transition bias (eq. S10)
+        self.gamma_cue = gamma_cue # gamma_e (eq. 9)
+        self.alpha_cue = alpha_cue # alpha_e (eq. 9)
         self.infer_bias = infer_bias
-        self.prior_precision_bias = prior_precision_bias
+        self.prior_precision_bias = prior_precision_bias # 1/sigma_b^2 (eq. 20)
         
         self.perturbations = perturbations
         self.cues = cues
@@ -208,8 +209,8 @@ class COIN:
         
         self.max_cores = max_cores
         
-        self.particles = particles
-        self.max_contexts = max_contexts
+        self.particles = particles # number of particles
+        self.max_contexts = max_contexts # maximum number of contexts that can be instantiated
         
         self.adaptation = adaptation
         
@@ -241,6 +242,7 @@ class COIN:
         self.plot_predicted_probability_cstar3 = plot_predicted_probability_cstar3
         self.plot_state_given_cstar3 = plot_state_given_cstar3
         
+        # for plotting
         self.retention_values = retention_values
         self.drift_values = drift_values
         self.state_values = state_values
@@ -248,12 +250,13 @@ class COIN:
         self.state_feedback_values = state_feedback_values
         
         if fig_dir is None:
-            fig_dir = "figures"
+            fig_dir = "figures/"
         self.fig_dir = fig_dir
+        os.makedirs(self.fig_dir, exist_ok=True)
         
     def simulate_coin(self):
         if self.cues is not None:
-            self.check_cue_labels()
+            self.cues = check_cue_labels(self.cues, self.perturbations)
         
         assert self.perturbations is not None, "perturbations unfound!"
         
@@ -270,14 +273,12 @@ class COIN:
             
             print("Simulting the COIN model")
             
-            parallel_coin_main_loop = lambda n: self.coin_main_loop(trials)["stored"]
-            
             # with multiprocessing.Pool(processes=self.max_cores) as pool:
-            #     results = pool.map(parallel_coin_main_loop, range(self.runs))
+            #     results = pool.map(parallel_coin_generative_main_loop, range(self.runs))
             # temp = results
             with trange(self.runs, dynamic_ncols=True) as pbar:
                 for n in pbar:
-                    coin_state = self.coin_main_loop(trials)
+                    coin_state = self.coin_generative_main_loop(trials)
                     temp.append(coin_state["stored"])
 
             w = np.ones(self.runs) / self.runs
@@ -309,9 +310,9 @@ class COIN:
                     
                 for n in range(self.runs):
                     if i == 0:
-                        coin_state_out[i] = self.coin_main_loop(trials)
+                        coin_state_out[i] = self.coin_generative_main_loop(trials)
                     else:
-                        coin_state_out[i] = self.coin_main_loop(trials, coin_state_in[i])
+                        coin_state_out[i] = self.coin_generative_main_loop(trials, coin_state_in[i])
                 
                 # calculate the log-likelihood
                 log_likelihood = np.zeros((self.runs, ))
@@ -348,7 +349,7 @@ class COIN:
                 trials = np.arange(adaptation_trials[-1]+1, num_trials)
                 
                 for n in range(self.runs):
-                    temp.append(self.coin_main_loop(trials, coin_state_in[n])["stored"])
+                    temp.append(self.coin_generative_main_loop(trials, coin_state_in[n])["stored"])
         
         S = {}
         S["runs"] = {}
@@ -367,11 +368,11 @@ class COIN:
         
         return S    
         
-    def coin_main_loop(self, trials: int, coin_state: Optional[Dict[str, Any]]=None):
+    def coin_generative_main_loop(self, trials: int, coin_state: Optional[Dict[str, Any]]=None):
         if trials[0] == 0:
             coin_state = self.initialise_coin()
         for trial in trials:
-            coin_state["trial"] = trial+1
+            coin_state["trial"] = trial
             coin_state = self.predict_context(coin_state)
             coin_state = self.predict_states(coin_state)
             coin_state = self.predict_state_feedback(coin_state)
@@ -396,7 +397,7 @@ class COIN:
         coin_state["feedback_observed"][np.isnan(self.perturbations)] = 0
         
         # self-transition bias
-        coin_state["kappa"] = self.alpha_context * self.rho_context / (1 - self.rho_context)
+        coin_state["kappa"] = self.alpha_context * self.rho_context / (1 - self.rho_context) # (eq. S10)
         
         # observation noise standard deviation
         coin_state["sigma_observation_noise"] = np.sqrt(self.sigma_sensory_noise ** 2 + self.sigma_motor_noise ** 2)
@@ -414,7 +415,7 @@ class COIN:
         coin_state["n_context"] = np.zeros((self.max_contexts + 1, self.max_contexts + 1, self.particles), dtype=int)
         
         # sampled context
-        coin_state["context"] = np.ones((self.particles, ), dtype=int) # note that 0 is the first context (instead of 1 as in James' code)
+        coin_state["context"] = np.ones((self.particles, ), dtype=int)
         
         # do cues exist?
         if self.cues is None:
@@ -440,13 +441,14 @@ class COIN:
         coin_state = self.sample_parameters(coin_state)
         
         # mean and variance of state (stationary distribution)
-        coin_state["state_filtered_mean"] = coin_state["drift"] / (1 - coin_state["retention"])
+        coin_state["state_filtered_mean"] = coin_state["drift"] / (1 - coin_state["retention"]) # (eq. 4)
         coin_state["state_filtered_var"] = (self.sigma_process_noise ** 2) / (1 - np.square(coin_state["retention"]))
         
         return coin_state
     
     def predict_context(self, coin_state: Dict[str, Any]):
-        if (coin_state["trial"]-1) in self.stationary_trials:
+        # re-initialise the context probabilities to their stationary values if it gets erased
+        if coin_state["trial"] in self.stationary_trials:
             for p in range(self.particles):
                 C = np.sum(coin_state["local_transition_matrix"][:, 0, p] > 0)
                 transmat = coin_state["local_transition_matrix"][:C, :C, p]
@@ -454,7 +456,7 @@ class COIN:
         else:
             prior_probabilities = np.zeros((self.max_contexts+1, self.particles))
             
-            inds_1 = np.tile(coin_state["context"][None], (self.max_contexts+1, 1)) - 1 # TODO: is the -1 right?
+            inds_1 = np.tile(coin_state["context"][None], (self.max_contexts+1, 1)) - 1 # for indexing
             inds_2 = np.tile(np.arange(self.max_contexts+1)[None], (self.particles, 1)).T
             inds_3 = np.tile(np.arange(self.particles)[None], (self.max_contexts+1, 1))
             for i in range(self.max_contexts+1):
@@ -493,7 +495,7 @@ class COIN:
             coin_state["predicted_probabilities"] = coin_state["prior_probabilities"]
             
         if "Kalman_gain_given_cstar2" in self.store:
-            if coin_state["trial"] > 1:
+            if coin_state["trial"] > 0:
                 max_inds = np.argmax(coin_state["predicted_probabilities"], axis=0)
                 inds = np.arange(self.particles)
                 
@@ -501,7 +503,7 @@ class COIN:
                 
                 kalman_gain = np.zeros((self.particles, ))
                 for i in range(self.particles):
-                    kalman_gain[i] = np.mean(coin_state["Kalman_gains"][max_inds[i], inds[i]])
+                    kalman_gain[i] = coin_state["Kalman_gains"][max_inds[i], inds[i]]
                 coin_state["Kalman_gain_given_cstar2"] = np.mean(kalman_gain)
                     
         if "state_given_cstar2" in self.store:
@@ -523,10 +525,11 @@ class COIN:
     def predict_states(self, coin_state: Dict[str, Any]):
         # propagate states (Equation 3)
         coin_state["state_mean"] = coin_state["retention"] * coin_state["state_filtered_mean"] + coin_state["drift"]
-        coin_state["state_var"] = np.square(coin_state["retention"]) * coin_state["state_filtered_var"] + np.square(self.sigma_process_noise)
+        # TODO: verify if we need to add the variance associated with the drift
+        coin_state["state_var"] = np.square(coin_state["retention"]) * coin_state["state_filtered_var"] + np.square(self.sigma_process_noise) + 1 / self.prior_precision_drift
         
         # index of novel states
-        inds_1 = coin_state["C"] # + 1
+        inds_1 = coin_state["C"] # TODO: check if this is correct now that we are initialising contexts from 1
         inds_2 = np.arange(self.particles)
         
         # novel states are initialised to follow the stationary distribution (under Gaussian LDS)
@@ -539,10 +542,11 @@ class COIN:
         coin_state["average_state"] = np.sum(coin_state["predicted_probabilities"] * coin_state["state_mean"]) / self.particles
         
         if "explicit" in self.store:
-            if coin_state["trial"] == 1:
+            # given posterior distribution.
+            if coin_state["trial"] == 0:
                 coin_state["explicit"] = np.mean(coin_state["state_mean"][0, :])
             else:
-                max_inds = np.argmax(coin_state["responsibiltiies"], axis=0)
+                max_inds = np.argmax(coin_state["responsibilties"], axis=0)
                 inds = np.arange(self.particles)
                 state_mean = np.zeros((self.particles, ))
                 for i in range(self.particles):
@@ -550,6 +554,7 @@ class COIN:
                 coin_state["explicit"] = np.mean(state_mean)
         
         if "state_given_cstar3" in self.store:
+            # given posterior predictive distribution.
             max_inds = np.argmax(coin_state["predicted_probabilities"], axis=0)
             inds = np.arange(self.particles)
             state_mean = np.zeros((self.particles, ))
@@ -560,11 +565,17 @@ class COIN:
         return coin_state
     
     def predict_state_feedback(self, coin_state: Dict[str, Any]):
-        # predict state feedback for each context (potential non-trivial context-specific bias term in visuo-motor tasks)
-        coin_state["state_feedback_mean"] = coin_state["state_mean"] + coin_state["bias"]
+        # predict state feedback for each context (potential non-trivial context-specific bias term in visuo-motor tasks) (eq. 19)
+        if "bias" in coin_state:
+            coin_state["state_feedback_mean"] = coin_state["state_mean"] + coin_state["bias"]
+        else:
+            coin_state["state_feedback_mean"] = coin_state["state_mean"]
         
         # variance of state feedback prediction for each context
-        coin_state["state_feedback_var"] = coin_state["state_var"] + np.square(coin_state["sigma_observation_noise"])
+        if "bias" in coin_state:
+            coin_state["state_feedback_var"] = coin_state["state_var"] + np.square(coin_state["sigma_observation_noise"]) + 1 / self.prior_precision_bias # (eq. 19)
+        else:
+            coin_state["state_feedback_var"] = coin_state["state_var"] + np.square(coin_state["sigma_observation_noise"]) # (eq. 19)
         
         coin_state = self.compute_marginal_distribution(coin_state)
         
@@ -580,7 +591,7 @@ class COIN:
         coin_state["motor_noise"] = self.sigma_motor_noise * np.random.randn()
         
         # state feedback
-        coin_state["state_feedback"] = self.perturbations[coin_state["trial"]-1] + coin_state["sensory_noise"] + coin_state["motor_noise"]
+        coin_state["state_feedback"] = self.perturbations[coin_state["trial"]] + coin_state["sensory_noise"] + coin_state["motor_noise"]
         
         # state feedback prediction error
         coin_state["prediction_error"] = coin_state["state_feedback"] - coin_state["state_feedback_mean"]
@@ -591,7 +602,7 @@ class COIN:
         # p(y_t|c_t)
         coin_state["probability_state_feedback"] = norm(coin_state["state_feedback_mean"], np.sqrt(coin_state["state_feedback_var"])).pdf(coin_state["state_feedback"])
         
-        if coin_state["feedback_observed"][coin_state["trial"]-1]:
+        if coin_state["feedback_observed"][coin_state["trial"]]:
             if coin_state["cues_exist"]:
                 # log p(y_t, q_t, c_t)
                 p_c = np.log(coin_state["prior_probabilities"]) + np.log(coin_state["cue_probabilities"]) + np.log(coin_state["probability_state_feedback"])
@@ -606,15 +617,15 @@ class COIN:
                 # log p(c_t)
                 p_c = np.log(coin_state["prior_probabilities"])
         
-        log_weights = log_sum_exp(p_c) # TODO: verify if this is indeed log p(y_t, q_t)
+        log_weights = log_sum_exp(p_c) # log p(y_t, q_t) (marginalise out contexts)
 
         p_c = p_c - log_weights # log p(c_t|y_t, q_t)
         
         # weights for resampling
-        w = np.exp(log_weights - log_sum_exp(log_weights.T, axis=0)) # TODO: again, verify if this holds true!
+        w = np.exp(log_weights - log_sum_exp(log_weights.T, axis=0))
         
         # draw indices of particles to propagate
-        if (coin_state["feedback_observed"][coin_state["trial"]-1]) or (coin_state["cues_exist"]):
+        if coin_state["feedback_observed"][coin_state["trial"]] or coin_state["cues_exist"]:
             coin_state["inds_resampled"] = systematic_resampling(w)
         else:
             coin_state["inds_resampled"] = np.arange(self.particles)
@@ -671,8 +682,10 @@ class COIN:
         return coin_state
     
     def sample_context(self, coin_state: Dict[str, Any]):
+        # sample context
         coin_state["context"] = np.sum(np.random.rand(self.particles) > np.cumsum(coin_state["responsibilities"], axis=0), axis=0) + 1
         
+        # increment the context count
         coin_state["p_new_x"] = np.where(coin_state["context"] > coin_state["C"])[0]
         coin_state["p_old_x"] = np.where(coin_state["context"] <= coin_state["C"])[0]
         coin_state["C"][coin_state["p_new_x"]] = coin_state["C"][coin_state["p_new_x"]] + 1
@@ -695,17 +708,17 @@ class COIN:
                 # sample the next stick-breaking weight
                 sb_weight = np.random.beta(1, self.gamma_cue * np.ones((self.particles, )))
                 
-                coin_state["global_cue_probabilities"][coin_state["Q"]+1, :] = coin_state["global_cue_probabilities"][coin_state["Q"], :] * (1 - sb_weight)
-                coin_state["global_cue_probabilities"][coin_state["Q"], :] = coin_state["global_cue_probabilities"][coin_state["Q"], :] * sb_weight
+                coin_state["global_cue_probabilities"][coin_state["Q"], :] = coin_state["global_cue_probabilities"][coin_state["Q"]-1, :] * (1 - sb_weight)
+                coin_state["global_cue_probabilities"][coin_state["Q"]-1, :] = coin_state["global_cue_probabilities"][coin_state["Q"]-1, :] * sb_weight
                 
         return coin_state
     
     def update_belief_about_states(self, coin_state: Dict[str, Any]):
+        # algorithm 3 (Kalman filtering)
         coin_state["Kalman_gains"] = coin_state["state_var"] / coin_state["state_feedback_var"]
-        if coin_state["feedback_observed"][coin_state["trial"]-1]:
+        if coin_state["feedback_observed"][coin_state["trial"]]:
             coin_state["state_filtered_mean"] = coin_state["state_mean"] + coin_state["Kalman_gains"] * coin_state["prediction_error"] * coin_state["H"][coin_state["context"]-1, :].T
             coin_state["state_filtered_var"] = (1 - coin_state["Kalman_gains"] * coin_state["H"][coin_state["context"]-1, :].T) * coin_state["state_var"]
-            # TODO: verify if the -1 is correct!
         else:
             coin_state["state_filtered_mean"] = coin_state["state_mean"]
             coin_state["state_filtered_var"] = coin_state["state_var"]
@@ -722,10 +735,11 @@ class COIN:
         g = coin_state["retention"] * coin_state["previous_state_filtered_var"] / coin_state["state_var"]
         m = coin_state["previous_state_filtered_mean"] + g * (coin_state["state_filtered_mean"] - coin_state["state_mean"])
         v = coin_state["previous_state_filtered_var"] + g * (coin_state["state_filtered_var"] - coin_state["state_var"]) * g
+        # sample from the smoothing posterior distribution
         coin_state["previous_x_dynamics"] = m + np.sqrt(v) * np.random.randn(self.max_contexts+1, self.particles)
         
         # sample x_t conitioned on x_{t-1} and y_t
-        if coin_state["feedback_observed"][coin_state["trial"]-1]:
+        if coin_state["feedback_observed"][coin_state["trial"]]:
             w = (coin_state["retention"] * coin_state["previous_x_dynamics"] + coin_state["drift"]) / np.square(self.sigma_process_noise) + \
                 coin_state["H"][coin_state["context"]-1, :].T / np.square(coin_state["sigma_observation_noise"]) * (coin_state["state_feedback"] - coin_state["bias"])
             v = 1 / (1 / np.square(self.sigma_process_noise) + coin_state["H"][coin_state["context"]-1, :].T / np.square(coin_state["sigma_observation_noise"])) 
@@ -738,7 +752,7 @@ class COIN:
         x_sample_novel = coin_state["state_filtered_mean"][inds_new_x[0], inds_new_x[1]] + np.sqrt(coin_state["state_filtered_var"][inds_new_x[0], inds_new_x[1]]) * \
             np.random.randn(n_new_x)
         
-        coin_state["x_bias"] = np.concatenate([coin_state["x_dynamics"][inds_old_x[0], inds_old_x[1]], x_sample_novel], axis=-1) # TODO: check the dimensions!
+        coin_state["x_bias"] = np.concatenate([coin_state["x_dynamics"][inds_old_x[0], inds_old_x[1]], x_sample_novel], axis=-1)
         coin_state["inds_observed"] = [
             np.concatenate([inds_old_x[0], inds_new_x[0]]), 
             np.concatenate([inds_old_x[1], inds_new_x[1]]), 
@@ -758,7 +772,7 @@ class COIN:
             # update sufficient for the parameters of the state dynamics function
             coin_state = self.update_sufficient_statistics_dynamics(coin_state)
         
-        if self.infer_bias and (coin_state["feedback_observed"][coin_state["trial"]-1]):
+        if self.infer_bias and (coin_state["feedback_observed"][coin_state["trial"]]):
             coin_state = self.update_sufficient_statistics_bias(coin_state)
         
         return coin_state
@@ -792,32 +806,6 @@ class COIN:
         
         return coin_state
         
-    def check_cue_labels(self):
-        assert self.perturbations is not None
-        
-        num_trials = len(self.perturbations)
-        
-        for i in range(num_trials):
-            if i == 0:
-                if self.cues[i] != 1:
-                    self.renumber_cues()
-                    break
-            else:
-                if (self.cues[i] not in self.cues[:i]) and (self.cues[i] != np.max(self.cues[:i])+1):
-                    self.renumber_cues()
-                    break
-    
-    def renumber_cues(self):
-        cue_order = np.unique(self.cues)
-        
-        if self.cues.ndim == 1:
-            self.cues = np.where(np.isin(cue_order, self.cues))
-        else:
-            cues = np.where(np.isin(cue_order, self.cues.T))
-            self.cues = cues.T
-        
-        print("Cues have been numbered according to the order they were presented in the experiments.")
-        
     def sample_parameters(self, coin_state: Dict[str, Any]):
         # sample global transition probabilities
         coin_state = self.sample_global_transition_probabilities(coin_state)
@@ -844,8 +832,9 @@ class COIN:
         return coin_state
     
     def sample_global_transition_probabilities(self, coin_state: Dict[str, Any]):
+        # global context DP (eq. 7)
         if coin_state["trial"] == 0:
-            coin_state["global_transition_probabilities"] = np.zeros((self.max_contexts + 1, self.particles))
+            coin_state["global_transition_probabilities"] = np.zeros((self.max_contexts+1, self.particles))
             coin_state["global_transition_probabilities"][0, :] = 1.
         else:
             # sample the number of tables in restaurant i serving dish j
@@ -879,21 +868,23 @@ class COIN:
                 m_context_bar[inds_1, inds_2, inds_3] = coin_state["m_context"][inds_1, inds_2, inds_3] - \
                     np.random.binomial(coin_state["m_context"][inds_1, inds_2, inds_3], p)
             
-            # TODO: what is this line doing?
+            # handling boundary condition
             m_context_bar[0, 0, m_context_bar[0, 0, :] == 0] = 1
             
             # sample beta
             inds = np.where(coin_state["C"] != self.max_contexts)[0]
             inds_C = coin_state["C"][inds] # + 1
-            coin_state["global_transition_posterior"] = np.sum(m_context_bar, axis=0)
+            global_transition_posterior_dirichlet_param = np.sum(m_context_bar, axis=0)
             for i in range(len(inds)):
-                coin_state["global_transition_posterior"][inds_C[i], inds[i]] = self.gamma_context
+                global_transition_posterior_dirichlet_param[inds_C[i], inds[i]] = self.gamma_context
             
-            coin_state["global_transition_probabilities"] = random_dirichlet(coin_state["global_transition_posterior"])
+            coin_state["global_transition_probabilities"] = random_dirichlet(global_transition_posterior_dirichlet_param)
 
         return coin_state
     
     def sample_global_cue_probabilities(self, coin_state: Dict[str, Any]):
+        # global cue DP (eq. 9)
+        # similar to sample_global_transition_probabilities but without self-transition bias ("loyalty customers")
         if coin_state["trial"] == 0:
             coin_state["global_cue_probabilities"] = np.zeros((np.max(self.cues)+1, self.particles))
             coin_state["global_cue_probabilities"][0, :] = 1.0
@@ -904,7 +895,7 @@ class COIN:
                 coin_state["n_cue"], 
             )
             
-            # sample beta_e (for cue CRF)
+            # sample beta_e
             coin_state["global_cue_posterior"] = np.reshape(np.sum(coin_state["m_cue"], axis=0), (self.cues+1, self.particles))
             coin_state["global_cue_posterior"][coin_state["Q"]+1, :] = self.gamma_cue
             
@@ -913,6 +904,7 @@ class COIN:
         return coin_state
     
     def update_local_transition_matrix(self, coin_state: Dict[str, Any]):
+        # local context DP (eq. 8)
         coin_state["local_transition_matrix"] = np.reshape(
             self.alpha_context * coin_state["global_transition_probabilities"], 
             [1, self.max_contexts + 1, self.particles], 
@@ -926,7 +918,7 @@ class COIN:
         coin_state["local_transition_matrix"] = coin_state["local_transition_matrix"] * zero_mass_contexts
         
         # compute stationary context probabilities if necessary
-        if ("statioanry_probabilities" in self.store) and (coin_state["trial"] > 0):
+        if ("stationary_probabilities" in self.store) and (coin_state["trial"] > 0):
             coin_state["stationary_probabilities"] = np.zeros((self.max_contexts+1, self.particles))
             
             for p in range(self.particles):
@@ -937,6 +929,7 @@ class COIN:
         return coin_state
     
     def update_local_cue_matrix(self, coin_state: Dict[str, Any]):
+        # local cue DP (eq. 9)
         coin_state["local_cue_matrix"] = np.reshape(
             self.alpha_cue * coin_state["global_cue_probabilities"], 
             (1, np.max(self.cues) + 1, self.particles)
@@ -949,9 +942,9 @@ class COIN:
         return coin_state
     
     def sample_dynamics(self, coin_state: Dict[str, Any]):
-        # sample state retention and drift parameters (equations S21 and S22 in the supplemental)
+        # sample state retention and drift parameters (eqs. S21 and S22)
         
-        # prior mean and precision matrix
+        # prior mean and precision matrix (eq. 10)
         dynamics_mean = np.array([self.prior_mean_retention, 0])
         dynamics_lambda = np.eye(2) * np.array([self.prior_precision_retention, self.prior_precision_drift])
         
@@ -996,6 +989,7 @@ class COIN:
     
     def compute_marginal_distribution(self, coin_state: Dict[str, Any]):
         if "state_distribution" in self.store:
+            # predict state (marginalisation over contexts and particles)
             x = np.reshape(self.state_values, (1, 1, self.state_values.size))
             mu = coin_state["state_mean"]
             std = np.sqrt(coin_state["state_var"])
@@ -1025,7 +1019,7 @@ class COIN:
         if "stored" not in coin_state:
             coin_state["stored"] = {}
         
-        if ((coin_state["trial"] == 1) and (store_on == "current_trial")) or ((coin_state["trial"] == 2) and (store_on == "previous_trial")):
+        if ((coin_state["trial"] == 0) and (store_on == "current_trial")) or ((coin_state["trial"] == 1) and (store_on == "previous_trial")):
             s = list(coin_state[variable].shape) + [coin_state["num_trials"]]
             coin_state["stored"][variable] = np.ones(s) * np.nan
             
@@ -1034,7 +1028,7 @@ class COIN:
         elif store_on == "previous_trial":
             trial = coin_state["trial"] - 1
         
-        coin_state["stored"][variable][..., trial-1] = coin_state[variable]
+        coin_state["stored"][variable][..., trial] = coin_state[variable]
         
         return coin_state
 
@@ -1050,7 +1044,7 @@ class COIN:
     
     def update_sufficient_statistics_global_cue_probabilities(self, coin_state: Dict[str, Any]):
         inds_1 = coin_state["context"] - 1 # TODO: is the -1 right?
-        inds_2 = self.cues[coin_state["trial"]-1] * np.ones((self.particles, ))
+        inds_2 = self.cues[coin_state["trial"]] * np.ones((self.particles, ))
         inds_3 = np.arange(self.particles)
         
         for i in range(self.particles):

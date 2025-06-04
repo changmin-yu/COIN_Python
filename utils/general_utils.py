@@ -18,7 +18,7 @@ along with COIN_Python. If not, see <https://www.gnu.org/licenses/>.
 """
 
 
-from typing import List
+from typing import List, Optional
 import numpy as np
 
 
@@ -187,6 +187,39 @@ def renumber_cues(cues: np.ndarray):
     print("Cues have been numbered according to the order they were presented in the experiments.")
     
     return cues
+
+
+def randnumtable_simple(
+    weights: np.ndarray, 
+    max_tables: np.ndarray, 
+    seed: Optional[int] = None, 
+):
+    """
+    Straightforward implementation of sampling from a CRF distribution 
+    (rather than using the Stirling number).
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    if weights.shape != max_tables.shape:
+        raise ValueError("weights and max_tables must have the same shape")
+    
+    num_tables = np.zeros_like(max_tables, dtype=max_tables.dtype)
+    
+    for ind in np.ndindex(weights.shape):
+        weight = weights[ind]
+        num_table = int(max_tables[ind])
+        
+        if num_table == 0:
+            num_tables[ind] = 0
+        else:
+            num_table = 1
+            for i in range(1, num_table):
+                if np.random.random() < weight / (i + weight):
+                    num_table += 1
+            num_tables[ind] = num_table
+    
+    return num_tables
     
 
 if __name__=="__main__":

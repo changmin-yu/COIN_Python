@@ -35,6 +35,7 @@ def main():
     
     output = coin_model.simulate_coin()
     
+    plt.figure(figsize=(8, 5))
     plt.plot(output["runs"][0]["state_feedback"], "b.", label="state feedback")
     plt.plot(output["runs"][0]["motor_output"], "r", label="motor output")
     plt.legend()

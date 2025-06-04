@@ -19,6 +19,7 @@ along with COIN_Python. If not, see <https://www.gnu.org/licenses/>.
 
 
 import numpy as np
+from typing import Union
 
 from utils.general_utils import (
     per_slice_cholesky, 
@@ -27,6 +28,114 @@ from utils.general_utils import (
 
 from scipy.stats import truncnorm
 from scipy.special import erfc, erfcinv
+
+
+import numpy as np
+from scipy.stats import beta
+
+def random_binomial(p: Union[float, np.ndarray], n: Union[int, np.ndarray]):
+    """
+    Sample from a Binomial distribution with parameters n and p.
+    
+    Parameters:
+    -----------
+    p : float or ndarray
+        Probability of success (must be between 0 and 1)
+        Can be a scalar, 1D array, or n-dimensional array
+    n : int or ndarray
+        Number of trials (must be non-negative)
+        Can be a scalar, 1D array, or n-dimensional array
+        
+    Returns:
+    --------
+    int or ndarray
+        Random sample(s) from Binomial(n, p)
+        Returns array with same shape as input p and n
+        
+    Notes:
+    ------
+    Uses three different methods depending on n and p:
+    1. For small n (< 15) or when p > 0.5 and n < 15: Coin flip method (O(n) time)
+    2. For small n*p (< 10): Waiting time method (O(np) time)
+    3. For other cases: Recursive method based on beta distribution (O(log(log(n))) recursive calls)
+    """
+    # Convert scalar inputs to arrays
+    is_scalar = np.isscalar(p) and np.isscalar(n)
+    p = np.asarray(p, dtype=float)
+    n = np.asarray(n, dtype=int)
+    
+    # Ensure p and n have the same shape
+    if p.shape != n.shape:
+        raise ValueError("p and n must have the same shape")
+    
+    original_shape = p.shape
+    
+    # Flatten arrays for processing
+    p_flat = p.ravel()
+    n_flat = n.ravel()
+    
+    # Handle edge cases
+    mask = np.isnan(p_flat) | (p_flat < 0) | (p_flat > 1) | (n_flat < 0)
+    result = np.full_like(n_flat, 0, dtype=float)
+    
+    # Process valid inputs
+    valid_mask = ~mask
+    if not np.any(valid_mask):
+        return result.reshape(original_shape)[0] if is_scalar else result.reshape(original_shape)
+    
+    # Initialize result array for valid inputs
+    valid_indices = np.where(valid_mask)[0]
+    result_flat = np.zeros_like(n_flat, dtype=float)
+    
+    # Process each valid input
+    for i, idx in enumerate(valid_indices):
+        n_val = n_flat[idx]
+        p_val = p_flat[idx]
+        
+        # Special cases
+        if n_val == 0:
+            result_flat[idx] = 0
+            continue
+            
+        if p_val == 0:
+            result_flat[idx] = 0
+            continue
+            
+        if p_val == 1:
+            result_flat[idx] = n_val
+            continue
+            
+        # Method 1: Coin flip method for small n or when p > 0.5 and n < 15
+        if n_val < 15 or (p_val > 0.5 and n_val < 15):
+            result_flat[idx] = np.sum(np.random.random(n_val) < p_val)
+            continue
+            
+        # Method 2: Waiting time method for small n*p
+        if n_val * p_val < 10:
+            q = -np.log(1 - p_val)
+            r = n_val
+            e = -np.log(np.random.random())
+            s = e/r
+            while s <= q:
+                r -= 1
+                if r == 0:
+                    break
+                e = -np.log(np.random.random())
+                s += e/r
+            result_flat[idx] = n_val - r
+            continue
+            
+        # Method 3: Recursive method using beta distribution
+        i = int(p_val * (n_val + 1))
+        b = beta.rvs(i, n_val + 1 - i)
+        if b <= p_val:
+            result_flat[idx] = i + random_binomial((p_val - b)/(1 - b), n_val - i)
+        else:
+            result_flat[idx] = i - 1 - random_binomial((b - p_val)/b, i - 1)
+    
+    # Reshape result to match input shape
+    result = result_flat.reshape(original_shape)
+    return result[0] if is_scalar else result
 
 
 def random_gamma(r: float):
@@ -68,6 +177,84 @@ def random_gamma(r: float):
                 if (z <= (1.0 - 2.0 * (y ** 2) / x)) or (np.log(z) <= 2.0 * (b * np.log(x / b) - y)):
                     g = x
                     return g
+
+
+def random_gamma_simple(a: Union[np.ndarray, float]):
+    """
+    Sample from a Gamma distribution with shape parameter a and scale parameter 1.
+    
+    Parameters:
+    -----------
+    a : float or ndarray
+        Shape parameter(s) of the gamma distribution (must be > 0)
+        Can be a scalar, 1D array, or n-dimensional array
+        
+    Returns:
+    --------
+    float or ndarray
+        Random sample(s) from Gamma(a, 1)
+        Returns array with same shape as input a
+        
+    Notes:
+    ------
+    Uses Marsaglia and Tsang's method (2000) for a >= 1
+    For a < 1, uses Marsaglia's (1961) method to boost the sample
+    
+    Algorithm from:
+    G. Marsaglia and W.W. Tsang, A simple method for generating gamma
+    variables, ACM Transactions on Mathematical Software, Vol. 26, No. 3,
+    Pages 363-372, September, 2000.
+    """
+    # Convert scalar input to array
+    is_scalar = np.isscalar(a)
+    a = np.asarray(a, dtype=float)
+    original_shape = a.shape
+    
+    # Flatten array for processing
+    a_flat = a.ravel()
+    
+    # Handle edge cases
+    mask = np.isnan(a_flat) | (a_flat <= 0)
+    result = np.full_like(a_flat, 0)
+    
+    # Process valid inputs
+    valid_mask = ~mask
+    if not np.any(valid_mask):
+        return result.reshape(original_shape)[0] if is_scalar else result.reshape(original_shape)
+        
+    # For a < 1, use Marsaglia's (1961) method: gam(a) = gam(a+1)*U^(1/a)
+    boost = np.ones_like(a_flat)
+    small_a_mask = valid_mask & (a_flat < 1)
+    if np.any(small_a_mask):
+        boost[small_a_mask] = np.exp(np.log(np.random.random(np.sum(small_a_mask))) / a_flat[small_a_mask])
+        a_flat[small_a_mask] += 1
+        
+    # Marsaglia and Tsang's method for a >= 1
+    d = a_flat - 1.0/3
+    c = 1.0 / np.sqrt(9*d)
+    
+    # Generate samples for all valid inputs
+    valid_indices = np.where(valid_mask)[0]
+    for idx in valid_indices:
+        while True:
+            # Generate normal random variable
+            x = np.random.normal()
+            v = 1 + c[idx]*x
+            
+            if v <= 0:
+                continue
+                
+            v = v**3
+            x2 = x*x
+            u = np.random.random()
+            
+            if (u < 1 - 0.0331*x2*x2) or (np.log(u) < 0.5*x2 + d[idx]*(1 - v + np.log(v))):
+                result[idx] = boost[idx] * d[idx] * v
+                break
+    
+    # Reshape result to match input shape
+    result = result.reshape(original_shape)
+    return result[0] if is_scalar else result
                 
                 
 def random_gamma_ND(R: np.ndarray):
@@ -83,7 +270,8 @@ def random_gamma_ND(R: np.ndarray):
     
 
 def random_dirichlet(R: np.ndarray):
-    gamma_samples = random_gamma_ND(R)
+    # gamma_samples = random_gamma_ND(R)
+    gamma_samples = random_gamma_simple(R)
     return gamma_samples / np.sum(gamma_samples, axis=0, keepdims=True)
 
 

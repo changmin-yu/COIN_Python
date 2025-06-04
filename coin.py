@@ -50,6 +50,7 @@ from utils.distribution_utils import (
     stationary_distribution, 
     random_truncated_bivariate_normal, 
     random_univariate_normal, 
+    random_binomial, 
 )
 
 
@@ -878,7 +879,9 @@ class COIN:
                 inds_3 = inds_3[non_zero_inds_1, non_zero_inds_2]
                 
                 m_context_bar[inds_1, inds_2, inds_3] = coin_state["m_context"][inds_1, inds_2, inds_3] - \
-                    np.random.binomial(coin_state["m_context"][inds_1, inds_2, inds_3], p)
+                    random_binomial(p, coin_state["m_context"][inds_1, inds_2, inds_3])
+                # m_context_bar[inds_1, inds_2, inds_3] = coin_state["m_context"][inds_1, inds_2, inds_3] - \
+                #     np.random.binomial(coin_state["m_context"][inds_1, inds_2, inds_3], p)
             
             # handling boundary condition
             m_context_bar[0, 0, m_context_bar[0, 0, :] == 0] = 1

@@ -43,7 +43,7 @@ from utils.general_utils import (
     log_sum_exp, 
     systematic_resampling, 
     check_cue_labels,
-    randnumtable_simple, 
+    randnumtable_array, 
 )
 from utils.distribution_utils import (
     random_dirichlet, 
@@ -513,7 +513,7 @@ class COIN:
                 coin_state["Kalman_gain_given_cstar2"] = np.mean(kalman_gain)
                     
         if "state_given_cstar2" in self.store:
-            if coin_state["trial"] > 1:
+            if coin_state["trial"] > 0:
                 max_inds = np.argmax(coin_state["predicted_probabilities"], axis=0)
                 inds = np.arange(self.particles)
                 
@@ -532,7 +532,7 @@ class COIN:
         # propagate states (Equation 3)
         coin_state["state_mean"] = coin_state["retention"] * coin_state["state_filtered_mean"] + coin_state["drift"]
         # TODO: verify if we need to add the variance associated with the drift
-        coin_state["state_var"] = np.square(coin_state["retention"]) * coin_state["state_filtered_var"] + np.square(self.sigma_process_noise) + 1 / self.prior_precision_drift
+        coin_state["state_var"] = np.square(coin_state["retention"]) * coin_state["state_filtered_var"] + np.square(self.sigma_process_noise) # + 1 / self.prior_precision_drift
         
         # index of novel states
         inds_1 = coin_state["C"] # TODO: check if this is correct now that we are initialising contexts from 1
@@ -552,7 +552,7 @@ class COIN:
             if coin_state["trial"] == 0:
                 coin_state["explicit"] = np.mean(coin_state["state_mean"][0, :])
             else:
-                max_inds = np.argmax(coin_state["responsibilties"], axis=0)
+                max_inds = np.argmax(coin_state["responsibilities"], axis=0)
                 inds = np.arange(self.particles)
                 state_mean = np.zeros((self.particles, ))
                 for i in range(self.particles):
@@ -844,8 +844,8 @@ class COIN:
             coin_state["global_transition_probabilities"][0, :] = 1.
         else:
             # sample the number of tables in restaurant i serving dish j
-            if self.sample_crf_stirling:
-                coin_state["m_context"] = randnumtable_simple(
+            if not self.sample_crf_stirling:
+                coin_state["m_context"] = randnumtable_array(
                     self.alpha_context * coin_state["global_transition_probabilities"][None] + coin_state["kappa"] * np.eye(self.max_contexts+1)[..., None], 
                     coin_state["n_context"], # (max_contexts+1, max_contexts+1, particles)
                 )
@@ -878,10 +878,10 @@ class COIN:
                 inds_2 = inds_2[non_zero_inds_1, non_zero_inds_2]
                 inds_3 = inds_3[non_zero_inds_1, non_zero_inds_2]
                 
-                m_context_bar[inds_1, inds_2, inds_3] = coin_state["m_context"][inds_1, inds_2, inds_3] - \
-                    random_binomial(p, coin_state["m_context"][inds_1, inds_2, inds_3])
                 # m_context_bar[inds_1, inds_2, inds_3] = coin_state["m_context"][inds_1, inds_2, inds_3] - \
-                #     np.random.binomial(coin_state["m_context"][inds_1, inds_2, inds_3], p)
+                #     random_binomial(p, coin_state["m_context"][inds_1, inds_2, inds_3])
+                m_context_bar[inds_1, inds_2, inds_3] = coin_state["m_context"][inds_1, inds_2, inds_3] - \
+                    np.random.binomial(coin_state["m_context"][inds_1, inds_2, inds_3], p)
             
             # handling boundary condition
             m_context_bar[0, 0, m_context_bar[0, 0, :] == 0] = 1
@@ -905,8 +905,8 @@ class COIN:
             coin_state["global_cue_probabilities"][0, :] = 1.0
         else:
             # sample the number of tables in restaurant i serving dish j
-            if self.sample_crf_stirling:
-                coin_state["m_cue"] = randnumtable_simple(
+            if not self.sample_crf_stirling:
+                coin_state["m_cue"] = randnumtable_array(
                     np.tile(self.alpha_cue * coin_state["global_cue_probabilities"][None], (self.max_contexts+1, 1, 1)), 
                     coin_state["n_cue"], 
                 )
@@ -1188,6 +1188,7 @@ class COIN:
             if self.__dict__[f"plot_{s}"]:
                 P, S, optim_assignment, from_unique, c_seq, C = self.find_optimal_context_labels(S)
                 P, _ = self.compute_variables_for_plotting(P, S, optim_assignment, from_unique, c_seq, C)
+                break
             elif i == (len(variables_requiring_context_relabelling)-1):
                 P = self.preallocate_memory([]) # TODO: how does it handle empty dictionary?
                 P = self.integrate_over_runs(P, S)
@@ -1203,9 +1204,10 @@ class COIN:
         P["mode_number_of_contexts"] = mode_number_of_contexts
         
         # context label permutations
-        L = np.array(list(permutations(np.arange(np.max(mode_number_of_contexts)+1))))
-        L = np.transpose(L[None], (2, 0, 1))
-        n_perms = factorial(np.max(mode_number_of_contexts)+1) # + 1) # TODO: do we need +1?
+        # flipping 
+        L = np.array(list(permutations(np.arange(1, np.max(mode_number_of_contexts)+1)))[::-1])
+        L = np.transpose(L[None], (2, 0, 1)) # (C, 1, C!)
+        n_perms = factorial(np.max(mode_number_of_contexts)) # + 1) # TODO: do we need +1?
         
         num_trials = len(self.perturbations)
         
@@ -1214,88 +1216,90 @@ class COIN:
         from_unique = {}
         optimal_assignment = {}
         
-        for i in range(num_trials):
-            if np.mod(i+1, 50) == 0:
-                print(f"Finding optimal context labels (trial = {i+1})")
+        with trange(num_trials, desc="Finding optimal context labels") as pbar:
+            for i in pbar:
+        # for i in range(num_trials):
+        #     if np.mod(i+1, 50) == 0:
+        #         print(f"Finding optimal context labels (trial = {i+1})")
             
-            # exclude sequences for which C > max(mode_number_of_context) as these sequences
-            # (and their descendents) will never be analysed
-            f[i] = np.where(C[:, i] <= np.max(mode_number_of_contexts)+1)[0]
-            
-            # identify unique sequences (to avoid performing the same computations multiple times)
-            unique_seqs, inds, reverse_inds = np.unique(
-                context_sequence[i][f[i]], axis=0, return_index=True, return_inverse=True
-            )
-            to_unique[i] = inds
-            from_unique[i] = reverse_inds
-            
-            n_sequences = len(unique_seqs)
-            
-            # identify particles that have the same number of contexts as the most common number of
-            # contexts (only contexts (only these particles will be analysed)
-            valid_particle_inds = (C[f[i], i] == mode_number_of_contexts[i])
-            
-            if i == 0:
-                # hamming distances on trial 0
-                # dimension 2 of H considers all possible label permutations
-                H = (L[[0], :, :] != 1) * 1.0 # (1, 1, num_permutations)
-            else:
-                # identify a valid parent of each unique sequence
-                # i.e., a sequence on the previous trial that is identical up to the previous trial
-                inds, _ = np.where(f[i-1][:, None] == inds_resampled[f[i][to_unique[i]], i][None])
-                parent = from_unique[i-1][inds]
+                # exclude sequences for which C > max(mode_number_of_context) as these sequences
+                # (and their descendents) will never be analysed
+                f[i] = np.where(C[:, i] <= np.max(P["mode_number_of_contexts"]))[0]
                 
-                # pass Hamming distances from parents to children
-                inds_1 = np.tile(parent[:, None, None], [1, n_sequences, n_perms])
-                inds_2 = np.tile(parent[None, :, None], [n_sequences, 1, n_perms])
-                inds_3 = np.tile(np.arange(n_perms)[None, None], [n_sequences, n_sequences, 1])
+                # identify unique sequences (to avoid performing the same computations multiple times)
+                unique_seqs, inds, reverse_inds = np.unique(
+                    context_sequence[i][f[i]], axis=0, return_index=True, return_inverse=True
+                )
+                to_unique[i] = inds
+                from_unique[i] = reverse_inds
                 
-                H_new = np.zeros((n_sequences, n_sequences, n_perms))
+                n_sequences = len(unique_seqs)
                 
-                for ii in range(n_sequences):
-                    for jj in range(n_sequences):
-                        for kk in range(n_perms):
-                            H_new[ii, jj, kk] = H[inds_1[ii, jj, kk], inds_2[ii, jj, kk], inds_3[ii, jj, kk]]
+                # identify particles that have the same number of contexts as the most common number of
+                # contexts (only these particles will be analysed)
+                valid_particle_inds = (C[f[i], i] == P["mode_number_of_contexts"][i])
                 
-                # recursively update Hamming distances
-                # dimension 2 of H considers all possible label permutations
-                for seq in range(n_sequences):
-                    H_new[seq:, [seq], :] = H_new[seq:, [seq], :] + ((unique_seqs[seq, -1]-1) != L[unique_seqs[seq:, -1]-1, :, :]) * 1.0
-                    H_new[seq, seq:, :] = H_new[seq:, seq, :] # by symmetry of Hamming distance
+                if i == 0:
+                    # hamming distances on trial 0
+                    # dimension 2 of H considers all possible label permutations
+                    H = (L[[0], :, :] != 1) * 1.0 # (1, 1, num_permutations)
+                else:
+                    # identify a valid parent of each unique sequence
+                    # i.e., a sequence on the previous trial that is identical up to the previous trial
+                    inds, _ = np.where(f[i-1][:, None] == inds_resampled[f[i][to_unique[i]], i][None])
+                    parent = from_unique[i-1][inds]
+                    
+                    # pass Hamming distances from parents to children
+                    inds_1 = np.tile(parent[:, None, None], [1, n_sequences, n_perms])
+                    inds_2 = np.tile(parent[None, :, None], [n_sequences, 1, n_perms])
+                    inds_3 = np.tile(np.arange(n_perms)[None, None], [n_sequences, n_sequences, 1])
+                    
+                    H_new = np.zeros((n_sequences, n_sequences, n_perms))
+                    
+                    for ii in range(n_sequences):
+                        for jj in range(n_sequences):
+                            for kk in range(n_perms):
+                                H_new[ii, jj, kk] = H[inds_1[ii, jj, kk], inds_2[ii, jj, kk], inds_3[ii, jj, kk]]
+                    
+                    H = H_new.copy()
+                    
+                    # recursively update Hamming distances
+                    # dimension 2 of H considers all possible label permutations
+                    for seq in range(n_sequences):
+                        H[seq:, [seq], :] = H[seq:, [seq], :] + (unique_seqs[seq, -1] != L[unique_seqs[seq:, -1]-1, :, :]) * 1.0
+                        H[seq, seq:, :] = H[seq:, seq, :] # by symmetry of Hamming distance\
+            
+                # compute the Hamming distance between each pair of sequences (after optimally permuting labels)
+                H_optimal = np.min(H, axis=2)
                 
-                H = H_new
-            
-            # compute the Hamming distance between each pair of sequences (after optimally permuting labels)
-            H_optimal = np.min(H, axis=2)
-            
-            # count the number of times each unique sequence occurs
-            sequence_count = np.sum(
-                from_unique[i][valid_particle_inds][:, None] == np.arange(len(unique_seqs))[None], 
-                axis=0, 
-            )
-            
-            # compute the mean optimal Hamming distance of each sequence to all other sequences.
-            # the distance from sequence i to sequence j is weighted by the number of times sequence j occurs.
-            # if i == j, this weight is reduced by 1 so that the distance from one instance of sequence i to itself is ignore.
-            H_mean = np.mean(H_optimal * (sequence_count[None] - np.eye(n_sequences)), axis=1)
-            
-            # assign infinite distance to invalid sequences 
-            # i.e., sequences for which the number of contexts is not equal to the most common number of contexts
-            H_mean[sequence_count == 0] = np.inf
-            
-            # find the index of the typical sequence 
-            # (the sequence with minimum mean optimal Hamming distance to all other sequences)
-            min_ind = np.argmin(H_mean, axis=0)
-            
-            # typical context sequence
-            typical_sequence = unique_seqs[min_ind, :]
-            
-            # store the optimal permutation of labels for each sequence with respect to the typical sequence
-            j = np.argmin(H[min_ind, :, :], axis=-1)
-            optimal_assignment[i] = np.transpose(
-                L[:int(mode_number_of_contexts[i]+1), :, j].reshape((int(mode_number_of_contexts[i]+1), -1, 1)), 
-                [2, 0, 1], 
-            )
+                # count the number of times each unique sequence occurs
+                sequence_count = np.sum(
+                    from_unique[i][valid_particle_inds][:, None] == np.arange(len(unique_seqs))[None], 
+                    axis=0, 
+                )
+                
+                # compute the mean optimal Hamming distance of each sequence to all other sequences.
+                # the distance from sequence i to sequence j is weighted by the number of times sequence j occurs.
+                # if i == j, this weight is reduced by 1 so that the distance from one instance of sequence i to itself is ignore.
+                H_mean = np.mean(H_optimal * (sequence_count[None] - np.eye(n_sequences)), axis=1)
+                
+                # assign infinite distance to invalid sequences 
+                # i.e., sequences for which the number of contexts is not equal to the most common number of contexts
+                H_mean[sequence_count == 0] = np.inf
+                
+                # find the index of the typical sequence 
+                # (the sequence with minimum mean optimal Hamming distance to all other sequences)
+                min_ind = np.argmin(H_mean, axis=0)
+                
+                # typical context sequence
+                typical_sequence = unique_seqs[min_ind, :]
+                
+                # store the optimal permutation of labels for each sequence with respect to the typical sequence
+                j = np.argmin(H[min_ind, :, :], axis=-1)
+                optimal_assignment[i] = np.transpose(
+                    L[:int(mode_number_of_contexts[i]), :, j].reshape((int(mode_number_of_contexts[i]), -1, 1)), 
+                    [2, 1, 0], 
+                )[0]
         
         return P, S, optimal_assignment, from_unique, context_sequence, C
         
@@ -1306,7 +1310,6 @@ class COIN:
         
         for n in range(self.runs):
             p = self.particles * n + np.arange(self.particles)
-            # TODO: check the dimensions!
             inds_resampled[p, :] = self.particles * n + S["runs"][n]["inds_resampled"]
         
         return inds_resampled
@@ -1348,8 +1351,8 @@ class COIN:
             for context in range(np.max(C[:, i])):
                 posterior[context, i] = np.sum((C[:, i] == (context+1)) * particle_weight)
             
-            posterior_mean[i] = np.sum(np.arange(self.max_contexts+1) * posterior[:, i])
-            posterior_mode[i] = np.argmax(posterior[:, i])
+            posterior_mean[i] = np.sum((np.arange(self.max_contexts+1) + 1) * posterior[:, i])
+            posterior_mode[i] = np.argmax(posterior[:, i]) + 1
         
         return C, posterior, posterior_mean, posterior_mode
 
@@ -1395,9 +1398,12 @@ class COIN:
                         # is the latest context a novel context
                         # this is needed to store novel context probabilities
                         context_trajectory = context_sequence[i][p[particle], :]
-                        novel_context = context_trajectory[i] > np.max(context_trajectory[:i])
+                        try:
+                            novel_context = context_trajectory[i] > np.max(context_trajectory[:i])
+                        except Exception as e:
+                            novel_context = False
                         
-                        S = self.relabel_context_variables(S, optimal_assignment[i][0, from_unique[i][ind][0], :].astype(int), novel_context, particle, i, n)
+                        S = self.relabel_context_variables(S, optimal_assignment[i][from_unique[i][ind], :].astype(int)-1, novel_context, particle, i, n)
                     P = self.integrate_over_particles(S, P, valid_now, i, n)
                 
                 N += len(valid_future)
@@ -1408,7 +1414,7 @@ class COIN:
         if self.plot_state_given_context:
             P["state_given_novel_context"] = np.tile(
                 np.nanmean(P["state_given_context"][:, :, -1], axis=1, keepdims=True), 
-                [1, num_trials, 1, 1], 
+                [1, num_trials, 1], 
             )
             P["state_given_context"] = P["state_given_context"][:, :, :-1]
         
@@ -1417,7 +1423,7 @@ class COIN:
     def preallocate_memory(self, P: Dict[str, Any]):
         num_trials = len(self.perturbations)
 
-        mode_number_of_contexts = P["mode_number_of_contexts"].astype(int)+1
+        mode_number_of_contexts = P["mode_number_of_contexts"].astype(int)
         if self.plot_state_given_context:
             P["state_given_context"] = np.ones(
                 (self.state_values.size, num_trials, np.max(mode_number_of_contexts)+1, self.runs)
@@ -1455,7 +1461,7 @@ class COIN:
             ) * np.nan
         if self.plot_state:
             P["state"] = np.ones((self.state_values.size, num_trials, self.runs)) * np.nan
-        if self.plot_average_bias or self.plot_state:
+        if self.plot_average_state or self.plot_state:
             P["average_state"] = np.ones((num_trials, self.runs)) * np.nan
         if self.plot_bias:
             P["bias"] = np.ones((self.bias_values.size, num_trials, self.runs)) * np.nan
@@ -1508,7 +1514,6 @@ class COIN:
         
         if self.plot_responsibilities:
             if (trial == 0) or novel_context:
-                # TODO: check below for the dimensions for C
                 S["runs"][run]["responsibilities"][np.concatenate([np.arange(C-1), np.array([C])]), particle, trial] = \
                     S["runs"][run]["responsibilities"][optimal_assignment, particle, trial]
                 S["runs"][run]["responsibilities"][C-1, particle, trial] = np.nan
@@ -1527,7 +1532,7 @@ class COIN:
             S["runs"][run]["global_transition_posterior"][optimal_assignment, particle, trial] = S["runs"][run]["global_transition_posterior"][:C, particle, trial]
         if self.plot_local_transition_probabilities:
             S["runs"][run]["local_transition_matrix"][:C, :(C+1), particle, trial] = \
-                self.permute_transition_matrix_columns_and_rows(S["runs"][run]["local_transition_matrix"][:C, particle, trial], optimal_assignment)
+                self.permute_transition_matrix_columns_and_rows(S["runs"][run]["local_transition_matrix"][:C, :(C+1), particle, trial], optimal_assignment)
         if self.plot_local_cue_probabilities:
             S["runs"][run]["local_cue_matrix"][optimal_assignment, :, particle, trial] = S["runs"][run]["local_cue_matrix"][:C, :, particle, trial]
         
@@ -1536,12 +1541,13 @@ class COIN:
     def permute_transition_matrix_columns_and_rows(self, transmat: np.ndarray, optimal_assignment: np.ndarray):
         C = len(optimal_assignment)
         # inverse mapping (TODO: verify the dimensions == C)
-        inds_map = np.equal(optimal_assignment[:, None], np.arange(C)[None])
+        inds_map, _ = np.where(optimal_assignment == np.arange(C)[None])
+        # inds_map = np.equal(optimal_assignment[:, None], np.arange(C)[None])
         
         inds_1 = np.tile(inds_map[:, None], [1, C+1])
         inds_2 = np.tile(np.concatenate([inds_map, np.array([C+1])])[None], [C, 1])
         
-        permuted_transmat =  np.zeros_like(transmat)
+        permuted_transmat = np.zeros_like(transmat)
         for i in range(C):
             for j in range(C+1):
                 permuted_transmat[i, j] = transmat[inds_1[i], inds_2[j]]
@@ -1557,7 +1563,7 @@ class COIN:
         run: int, 
     ):
         C = int(P["mode_number_of_contexts"][trial])
-        novel_context = np.max(P["mode_number_of_contexts"]) + 1
+        novel_context = int(np.max(P["mode_number_of_contexts"])) + 1
         
         num_trials = len(self.perturbations)
         
@@ -1567,42 +1573,42 @@ class COIN:
                 mu = np.transpose(S["runs"][run]["state_mean"][:(C+1), particles, trial+1][..., None], [2, 1, 0])
                 sd = np.transpose(np.sqrt(S["runs"][run]["state_var"][:(C+1), particles, trial+1][..., None]), [2, 1, 0])
                 # TODO: check the dimensions!
-                P["state_given_context"][:, trial+1, np.concatenate([np.arange(C), np.array([novel_context])]), run] = \
+                P["state_given_context"][:, trial+1, np.concatenate([np.arange(C), np.array([novel_context])-1]), run] = \
                     np.sum(norm(mu, sd).pdf(self.state_values[:, None, None]), axis=1)
             if self.plot_predicted_probabilities:
-                P["predicted_probabilities"][trial+1, np.concatenate([np.arange(C), np.array([novel_context])]), run] = \
+                P["predicted_probabilities"][trial+1, np.concatenate([np.arange(C), np.array([novel_context])-1]), run] = \
                     np.sum(S["runs"][run]["predicted_probabilities"][:(C+1), particles, trial+1], axis=1)
         
         if self.plot_responsibilities:
-            P["responsibilities"][trial, np.concatenate([np.arange(C), np.array([novel_context])]), run] = \
+            P["responsibilities"][trial, np.concatenate([np.arange(C), np.array([novel_context])-1]), run] = \
                 self.sum_along_dimension(S["runs"][run]["responsibilities"][:(C+1), particles, trial], axis=1)
         if self.plot_stationary_probabilities:
-            P["stationary_probabilities"][trial, np.concatenate([np.arange(C), np.array([novel_context])]), run] = \
-                np.sum(S["runs"][run]["stationary_probabilities"][:(C+1), particles, trial], axis=1)
+            P["stationary_probabilities"][trial, np.concatenate([np.arange(C), np.array([novel_context])-1]), run] = \
+                np.sum(S["runs"][run]["stationary_probabilities"][:(C+1), particles, trial], axis=1, keepdims=True)
         if self.plot_retention_given_context:
             # TODO: verify the dimensions!
             mu = np.transpose(S["runs"][run]["dynamics_mean"][0, :C, particles, trial], [1, 0])
             std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][0, 0, :C, particles, trial]), [1, 0])
-            P["retention_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.retention_values), axis=1)
+            P["retention_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.retention_values), axis=1, keepdims=True)
         if self.plot_drift_given_context:
             mu = np.transpose(S["runs"][run]["dynamics_mean"][1, :C, particles, trial], [1, 0])
             std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][1, 1, :C, particles, trial]), [1, 0])
-            P["drift_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.drift_values), axis=1)
+            P["drift_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.drift_values), axis=1, keepdims=True)
         if self.plot_bias_given_context:
             mu = np.transpose(S["runs"][run]["bias_mean"][:C, particles, trial], [1, 0])
             std = np.transpose(np.sqrt(S["runs"][run]["bias_var"][:C, particles, trial]), [1, 0])
-            P["bias_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.bias_values), axis=1)
+            P["bias_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.bias_values), axis=1, keepdims=True)
         if self.plot_global_transition_probabilities:
             alpha = S["runs"][run]["global_transition_posterior"][:(C+1), particles, trial]
             P["global_transition_probabilities"][trial, np.concatenate([np.arange(C), np.array([novel_context])]), run] = \
-                np.sum(alpha / np.sum(alpha, axis=0, keepdims=True), axis=1)
+                np.sum(alpha / np.sum(alpha, axis=0, keepdims=True), axis=1, keepdims=True)
         if self.plot_local_transition_probabilities:
             P["local_transition_probabilities"][:C, np.concatenate([np.arange(C), np.array([novel_context])]), trial, run] = \
-                np.sum(S["runs"][run]["local_transition_matrix"][:C, :(C+1), particles, trial], axis=2)
+                np.sum(S["runs"][run]["local_transition_matrix"][:C, :(C+1), particles, trial], axis=2, keepdims=True)
         if self.plot_local_cue_probabilities:
             P["local_cue_probabilities"][
                 :C, np.concatenate([np.arange(np.max(self.cues[:trial])), np.array([np.max(self.cues)+1])]), trial, run
-            ] = np.sum(S["runs"][run]["local_cue_matrix"][:C, :(np.max(self.cues[:trial])+1), particles, trial], axis=2)
+            ] = np.sum(S["runs"][run]["local_cue_matrix"][:C, :(np.max(self.cues[:trial])+1), particles, trial], axis=2, keepdims=True)
         
         return P
     
@@ -1727,7 +1733,7 @@ class COIN:
         if self.plot_state_given_context:
             P["state_given_context"][:, 1:, :] = P["state_given_context"][:, 1:, :] / Z[:-1][None]
         if self.plot_predicted_probabilities:
-            P["predicted_probabilities"][1:, :] = P["predicted_probabilities"][1:, :] / Z[:-1][None]
+            P["predicted_probabilities"][1:, :] = P["predicted_probabilities"][1:, :] / Z[:-1]
         if self.plot_responsibilities:
             P["responsibilities"] = P["responsibilities"] / Z[None]
             P["novel_context_responsibility"] = P["responsibilities"][:, -1]
@@ -1770,11 +1776,11 @@ class COIN:
                 P["state_given_context"], 
                 y_lims, 
                 y_ticks, 
-                colors["contexts"][:np.max(P["mode_number_of_contexts"]), :], 
+                colors["contexts"][:np.max(P["mode_number_of_contexts"]).astype(int), :], 
                 ax=ax[0], 
             )
             ax[0].set_xticks([0, num_trials-1])
-            ax[0].set_xtick_labels([1, num_trials])
+            ax[0].set_xticklabels([1, num_trials])
             ax[0].set_xlim([0, num_trials-1])
             
             ax[0].set_ylabel("state|context")
@@ -1782,7 +1788,7 @@ class COIN:
             
             self.plot_image(P["state_given_novel_context"], y_lims, y_ticks, colors["new_context"], ax=ax[1])
             ax[1].set_xticks([0, num_trials-1])
-            ax[1].set_xtick_labels([1, num_trials])
+            ax[1].set_xticklabels([1, num_trials])
             ax[1].set_xlim([0, num_trials-1])
             
             ax[1].set_ylabel("state|novel_context")
@@ -1792,8 +1798,8 @@ class COIN:
         
         if self.plot_predicted_probabilities:
             fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-            ax.plot(P["predicted_probabilities"][:, -1], color=colors["new_context"], linewidth=lw)
-            for context in np.arange(np.max(P["mode_number_of_contexts"])):
+            ax.plot(P["predicted_probabilities"][:, -1], color=colors["new_context"][0], linewidth=lw)
+            for context in range(int(np.max(P["mode_number_of_contexts"]))):
                 predicted_probs = P["predicted_probabilities"][:, context]
                 t = np.where(~np.isnan(P["predicted_probabilities"][:, context]))[0][0]
                 predicted_probs[t-1] = P["predicted_probabilities"][t-1, -1]
@@ -1818,7 +1824,7 @@ class COIN:
             ax[0].set_xlabel("trials")
             ax[0].set_ylabel("known context responsibility")
             
-            ax[1].plot(P["novel_context_responsibility"], color=colors["new_context"], linewidth=lw)
+            ax[1].plot(P["novel_context_responsibility"], color=colors["new_context"][0], linewidth=lw)
             ax[1].set_xlim(0, num_trials)
             ax[1].set_ylim(-0.1, 1.1)
             ax[1].set_xticks([0, num_trials])
@@ -1830,7 +1836,7 @@ class COIN:
             
         if self.plot_stationary_probabilities:
             fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-            ax.plot(P["stationary_probabilities"][:, -1], color=colors["new_context"], linewidth=lw)
+            ax.plot(P["stationary_probabilities"][:, -1], color=colors["new_context"][0], linewidth=lw)
             for context in range(np.max(P["mode_number_of_contexts"])):
                 ax.plot(P["stationary_probabilities"][:, context], color=colors["contexts"][context, :], linewidth=lw)
             ax.set_xlim(0, num_trials)
@@ -1883,7 +1889,7 @@ class COIN:
         
         if self.plot_global_transition_probabilities:
             fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-            ax.plot(P["global_transition_probabilities"][:, -1], color=colors["new_context"], linewidth=lw)
+            ax.plot(P["global_transition_probabilities"][:, -1], color=colors["new_context"][0], linewidth=lw)
             for context in range(np.max(P["mode_number_of_contexts"])):
                 ax.plot(P["global_transition_probabilities"][:, context], color=colors["contexts"][context, :], linewidth=lw)
             ax.set_xlim(0, num_trials)
@@ -1901,7 +1907,7 @@ class COIN:
             )
             for from_context in range(np.max(P["mode_number_of_contexts"])):
                 ax[from_context].plot(
-                    P["local_transition_probabilities"][from_context, -1, :], color=colors["new_context"], linewidth=lw, label="to new context"
+                    P["local_transition_probabilities"][from_context, -1, :], color=colors["new_context"][0], linewidth=lw, label="to new context"
                 )
                 for to_context in range(np.max(P["mode_number_of_contexts"])):
                     ax[from_context].plot(
@@ -1920,7 +1926,7 @@ class COIN:
                 
         if self.plot_global_cue_probabilities:
             fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-            ax.plot(P["global_cue_probabilities"][:, -1], color=colors["new_context"], linewidth=lw, label="novel cue")
+            ax.plot(P["global_cue_probabilities"][:, -1], color=colors["new_context"][0], linewidth=lw, label="novel cue")
             for cue in range(np.max(self.cues)):
                 ax.plot(P["global_cue_probabilities"][:, cue], color=colors["cues"][cue, :], linewidth=lw, label=f"cue {cue}")
             ax.set_xlim(0, num_trials)
@@ -1938,7 +1944,7 @@ class COIN:
                 1, np.max(P["mode_number_of_contexts"]), figsize=(6*np.max(P["mode_number_of_contexts"]), 5), 
             )
             for context in range(np.max(P["mode_number_of_contexts"])):
-                ax[context].plot(P["local_cue_probabilities"][context, -1, :], color=colors["new_context"], linewidth=lw, label="novel context")
+                ax[context].plot(P["local_cue_probabilities"][context, -1, :], color=colors["new_context"][0], linewidth=lw, label="novel context")
                 for cue in range(np.max(self.cues)):
                     ax[context].plot(P["local_cue_probabilities"][context, cue, :], color=colors["cues"][cue, :], linewidth=lw, label=f"cue {cue}")
                 ax[context].set_title(f"context {context}")
@@ -1956,7 +1962,7 @@ class COIN:
             fig, ax = plt.subplots(1, 1, figsize=(5, 5))
             y_lims = [self.state_values[0], self.state_values[-1]]
             y_ticks = [-1, 0, 1]
-            self.plot_image(P["state"], y_lims, y_ticks, colors["marginal"], ax=ax)
+            self.plot_image(P["state"][..., None], y_lims, y_ticks, colors["marginal"], ax=ax)
             n_pixels = len(self.state_values)
             ax.plot(self.map_to_pixel_space(n_pixels, y_lims, P["average_state"]), color=colors["mean_of_marginal"], linewidth=lw)
             ax.set_xticks([0, num_trials-1])
@@ -2148,7 +2154,7 @@ class COIN:
             intensity = X[:, :, context] / np.max(X[:, :, context])
             for rgb in range(3):
                 data[:, :, rgb] = np.nansum(
-                    np.concatenate([data[:, :, rgb], (1-rgb_colors[context][rgb]) * intensity], axis=2), 
+                    np.concatenate([data[:, :, rgb][..., None], ((1-rgb_colors[context][rgb]) * intensity)[..., None]], axis=2), 
                     axis=2
                 )
         if y_lim[0] < y_lim[1]:
@@ -2162,7 +2168,7 @@ class COIN:
         y_ticks = np.sort(y_ticks)[::-1]
         
         ax.set_yticks(y_ticks_pixels)
-        ax.set_ytick_labels(y_ticks)
+        ax.set_yticklabels(y_ticks)
     
     def map_to_pixel_space(self, n_pixels: int, lims: List[float], y_ticks: List[float]):
         lims = np.sort(lims)[::-1]
@@ -2182,11 +2188,12 @@ class COIN:
             [0.9922, 0.7490, 0.4353], 
             [1.0000, 0.4980, 0], 
         ])
-        C["new_context"] = [0.7, 0.7, 0.7]
-        C["marginal"] = [208/255, 149/255, 213/255]
+        C["new_context"] = [[0.7, 0.7, 0.7]]
+        C["marginal"] = [[208/255, 149/255, 213/255]]
         C["mean_of_marginal"] = [54/255, 204/255, 255/255]
         if (self.cues is not None) and len(self.cues) > 0:
             # TODO: verify this!
             C["cues"] = get_cmap("copper", np.max(self.cues))
 
         return C
+    

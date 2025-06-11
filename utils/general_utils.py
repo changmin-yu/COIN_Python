@@ -20,6 +20,7 @@ along with COIN_Python. If not, see <https://www.gnu.org/licenses/>.
 
 from typing import List, Optional
 import numpy as np
+import random
 
 
 def sample_num_tables_CRF(
@@ -136,7 +137,7 @@ def per_slice_cholesky(X: np.ndarray):
 
 
 def log_sum_exp(log_probs: np.ndarray, axis: int = 0):
-    m = np.max(log_probs, axis=axis)
+    m = np.max(log_probs, axis=axis, keepdims=True)
     l = m + np.log(np.sum(np.exp(log_probs - m), axis=axis))
     
     return l
@@ -214,12 +215,39 @@ def randnumtable_simple(
             num_tables[ind] = 0
         else:
             num_table = 1
-            for i in range(1, num_table):
+            for i in range(1, num_table+1):
                 if np.random.random() < weight / (i + weight):
                     num_table += 1
             num_tables[ind] = num_table
     
     return num_tables
+
+
+def randnumtable(alpha: float, numdata: int) -> int:
+    """
+    Python re-implementation of MATLAB's randnumtable (using drand48-style Bernoulli draws):
+    - alpha: concentration parameter (double)
+    - numdata: number of customers/data points (int)
+    Returns the number of tables (int).
+    """
+    if numdata == 0:
+        return 0
+    numtable = 1
+    for ii in range(1, numdata):
+        if random.random() < alpha / (ii + alpha):
+            numtable += 1
+    return numtable
+
+def randnumtable_array(alpha_array: np.ndarray, nd_array: np.ndarray) -> np.ndarray:
+    """
+    Vectorized version: applies randnumtable elementwise over two equally-shaped arrays.
+    """
+    if alpha_array.shape != nd_array.shape:
+        raise ValueError("alpha_array and nd_array must have the same shape")
+    flat_alpha = alpha_array.ravel()
+    flat_nd = nd_array.ravel().astype(int)
+    result = [randnumtable(a, n) for a, n in zip(flat_alpha, flat_nd)]
+    return np.array(result).reshape(alpha_array.shape)
     
 
 if __name__=="__main__":

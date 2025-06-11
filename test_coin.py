@@ -25,14 +25,42 @@ from coin import COIN
 
 
 def main():
-    coin_model = COIN() # use default parameters for now
+    # coin_model = COIN(sample_crf_stirling=False) # use default parameters for now
+    # coin_model.perturbations = np.concatenate([
+    #     np.zeros((50, )), 
+    #     np.ones((125, )), 
+    #     -np.ones((15, )), 
+    #     np.ones((150, )) * np.nan, 
+    # ])
+    
+    # output = coin_model.simulate_coin()
+    
+    retention_values = np.linspace(0.8, 1, 500, endpoint=True)
+    drift_values = np.linspace(-0.1, 0.1, 500, endpoint=True)
+    state_values = np.linspace(-1.5, 1.5, 500, endpoint=True)
+    bias_values = np.linspace(-1.5, 1.5, 500, endpoint=True)
+    state_feedback_values = np.linspace(-1.5, 1.5, 500, endpoint=True)
+
+    store = [
+        "state_feedback", "motor_output", "responsibilities", 
+    ]
+
+    coin_model = COIN(
+        retention_values=retention_values, 
+        drift_values=drift_values, 
+        state_values=state_values, 
+        bias_values=bias_values, 
+        state_feedback_values=state_feedback_values, 
+        store=store, 
+        sample_crf_stirling=True, 
+    ) # use default parameters for now
     coin_model.perturbations = np.concatenate([
         np.zeros((50, )), 
         np.ones((125, )), 
         -np.ones((15, )), 
         np.ones((150, )) * np.nan, 
     ])
-    
+
     output = coin_model.simulate_coin()
     
     plt.figure(figsize=(8, 5))

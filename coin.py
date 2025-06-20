@@ -756,7 +756,7 @@ class COIN:
         else:
             w = (coin_state["retention"] * coin_state["previous_x_dynamics"] + coin_state["drift"]) / np.square(self.sigma_process_noise)
             v = 1 / (1 / np.square(self.sigma_process_noise))
-        coin_state["x_dynamics"] = v * w + np.emath.sqrt(v) * np.random.randn(self.max_contexts+1, self.particles)
+        coin_state["x_dynamics"] = v * w + np.sqrt(v) * np.random.randn(self.max_contexts+1, self.particles)
 
         x_sample_novel = coin_state["state_filtered_mean"][inds_new_x[0], inds_new_x[1]] + np.sqrt(coin_state["state_filtered_var"][inds_new_x[0], inds_new_x[1]]) * \
             np.random.randn(n_new_x)
@@ -1093,7 +1093,10 @@ class COIN:
         # Make sure the variables are not complex
         assert ~(np.imag(coin_state["dynamics_ss_1"]) != 0).any()
         assert ~(np.imag(coin_state["dynamics_ss_2"]) != 0).any()
-
+        if coin_state["dynamics_ss_1"].dtype == np.complex128 and ~(np.imag(coin_state["dynamics_ss_1"]) != 0).any():
+            coin_state["dynamics_ss_1"] = np.float64(coin_state["dynamics_ss_1"])
+        if coin_state["dynamics_ss_2"].dtype == np.complex128 and ~(np.imag(coin_state["dynamics_ss_2"]) != 0).any():
+            coin_state["dynamics_ss_2"] = np.float64(coin_state["dynamics_ss_2"])
         return coin_state
     
     def update_sufficient_statistics_bias(self, coin_state: Dict[str, Any]):
@@ -1178,7 +1181,7 @@ class COIN:
         variables_requiring_context_relabelling = [
             "state_given_context", 
             "predicted_probabilities", 
-            "responsibilities", 
+            "responsibilties", 
             "stationary_probabilities", 
             "retention_given_context", 
             "drift_given_context", 
@@ -1820,7 +1823,7 @@ class COIN:
         if self.plot_responsibilities:
             fig, ax = plt.subplots(1, 2, figsize=(12, 5))
             for context in range(np.max(P["mode_number_of_contexts"])):
-                ax[0].plot(P["known_context_responsibilities"][:, context], color=colors["contexts"][context, :], linewidth=lw)
+                ax[0].plot(P["known_context_responsibilties"][:, context], color=colors["contexts"][context, :], linewidth=lw)
             ax[0].set_xlim(0, num_trials)
             ax[0].set_ylim(-0.1, 1.1)
             ax[0].set_xticks([0, num_trials])

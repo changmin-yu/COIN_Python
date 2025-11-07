@@ -26,7 +26,7 @@ from utils.general_utils import (
     per_slice_multiply, 
 )
 
-from scipy.stats import truncnorm
+from scipy.stats import truncnorm, norm
 from scipy.special import erfc, erfcinv
 
 
@@ -275,6 +275,26 @@ def random_dirichlet(R: np.ndarray):
     return gamma_samples / np.sum(gamma_samples, axis=0, keepdims=True)
 
 
+def random_dirichlet_fast(R: np.ndarray):
+    R = np.asarray(R, dtype=np.float64)
+    if R.ndim != 2:
+        raise ValueError("Input R must be a 2D array")
+    
+    C, N = R.shape
+    valid_inds = R > 0
+    if np.any(~valid_inds.any(axis=0)):
+        raise ValueError("All columns of R must have at least one positive entry")
+    
+    gammas = np.zeros((C, N), dtype=np.float64)
+    gammas[valid_inds] = np.random.gamma(R[valid_inds], scale=1.0)
+    gammas_rs = gammas.sum(axis=0, keepdims=True)
+    
+    dirichlet_samples = np.divide(gammas, gammas_rs, out=np.zeros_like(gammas), where=(gammas_rs>0))
+    dirichlet_samples[~valid_inds] = 0.0
+
+    return dirichlet_samples
+
+
 def stationary_distribution(transmat: np.ndarray):
     # statioanry distribution of a time-homogeneous Markov process
     
@@ -295,7 +315,11 @@ def stationary_distribution(transmat: np.ndarray):
     return p
 
 
-def random_truncated_bivariate_normal(mu: np.ndarray, cov: np.ndarray):
+def random_truncated_bivariate_normal(
+    mu: np.ndarray, 
+    cov: np.ndarray, 
+    simple_sampling: bool = False, 
+):
     cov_cholesky = per_slice_cholesky(cov)
     
     lb, ub = 0.0, 1.0 # truncation bounds
@@ -314,7 +338,12 @@ def random_truncated_bivariate_normal(mu: np.ndarray, cov: np.ndarray):
     # samples from the desired truncated normal distribution
     # x = mu + per_slice_multiply(cov_cholesky, np.reshape(truncnorm.rvs(lb_normal, ub_normal), [2, cov.shape[2]])[..., None]) # TODO: use numpy/scipy truncated normal generator
     # use self-defined truncated-normal random generator
-    samples = trandn(lb_normal, ub_normal)
+    if simple_sampling:
+        samples1 = truncnorm.rvs(loc=0, scale=1, a=lb_normal[0, :], b=ub_normal[0, :], size=mu.shape[1])
+        samples2 = norm.rvs(loc=0, scale=1, size=mu.shape[1])
+        samples = np.array([samples1, samples2])
+    else:
+        samples = trandn(lb_normal, ub_normal)
     x = mu + per_slice_multiply(cov_cholesky, np.reshape(samples, [2, cov.shape[2]])[..., None])
     
     return x

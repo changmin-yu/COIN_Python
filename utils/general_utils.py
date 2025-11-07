@@ -112,11 +112,12 @@ def stirling_number(
     
     
 def per_slice_invert(L: np.ndarray):
+    assert L.ndim == 3 # (2, 2, num_particles)
     L_determinant = L[0, 0] * L[1, 1] - L[1, 0] * L[0, 1]
     L_inverse = np.array([
         np.array([L[1, 1] * 1, L[0, 1] * (-1)]), 
         np.array([L[1, 0] * (-1), L[0, 0] * 1]), 
-    ]) / L_determinant
+    ]) / L_determinant[None, None, :]
     
     return L_inverse
 
@@ -166,7 +167,7 @@ def check_cue_labels(cues: np.ndarray, perturbations: np.ndarray):
     for i in range(num_trials):
         if i == 0:
             if cues[i] != 1:
-                cues = renumber_cues()
+                cues = renumber_cues(cues)
                 break
         else:
             if (cues[i] not in cues[:i]) and (cues[i] != np.max(cues[:i])+1):
@@ -177,6 +178,7 @@ def check_cue_labels(cues: np.ndarray, perturbations: np.ndarray):
 
 
 def renumber_cues(cues: np.ndarray):
+    # use 1-indexing for cues
     unique_cues, inds = np.unique(cues, return_index=True)
     unique_cues = unique_cues[np.argsort(inds)]
     
@@ -225,10 +227,11 @@ def randnumtable_simple(
 
 def randnumtable(alpha: float, numdata: int) -> int:
     """
-    Python re-implementation of MATLAB's randnumtable (using drand48-style Bernoulli draws):
+    Python re-implementation of MATLAB's randnumtable:
     - alpha: concentration parameter (double)
     - numdata: number of customers/data points (int)
-    Returns the number of tables (int).
+    Returns sampled number of tables (int) given numdata 
+        customers following a DP with concentration alpha.
     """
     if numdata == 0:
         return 0
@@ -237,6 +240,7 @@ def randnumtable(alpha: float, numdata: int) -> int:
         if random.random() < alpha / (ii + alpha):
             numtable += 1
     return numtable
+
 
 def randnumtable_array(alpha_array: np.ndarray, nd_array: np.ndarray) -> np.ndarray:
     """

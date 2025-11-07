@@ -19,6 +19,8 @@ def main():
         state_feedback_values=state_feedback_values,
         store=["state_feedback", "motor_output"],
         sample_crf_stirling=False,  # use default parameters for now
+        simple_sampling=True, 
+        max_cores=4, 
     )
     coin.perturbations = np.concatenate([
         np.zeros((192, )), 

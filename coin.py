@@ -34,7 +34,8 @@ from matplotlib.cm import get_cmap
 
 from tqdm import trange
 
-import multiprocessing
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 
 from utils.general_utils import (
     sample_num_tables_CRF, 
@@ -51,6 +52,7 @@ from utils.distribution_utils import (
     random_truncated_bivariate_normal, 
     random_univariate_normal, 
     random_binomial, 
+    random_dirichlet_fast, 
 )
 
 
@@ -190,10 +192,11 @@ class COIN:
         fig_dir: Optional[str] = None, 
         # misc
         sample_crf_stirling: bool = True, 
+        simple_sampling: bool = False, 
     ):
         self.sigma_process_noise = sigma_process_noise # sigma_q (eq. 3)
         self.sigma_sensory_noise = sigma_sensory_noise # sigma_r (eq. 5)
-        self.sigma_motor_noise = sigma_motor_noise
+        self.sigma_motor_noise = sigma_motor_noise # sigma_u
         self.prior_mean_retention = prior_mean_retention # mu_a (eq. 10)
         self.prior_precision_retention = prior_precision_retention # 1/sigma_a^2 (eq. 10)
         self.prior_precision_drift = prior_precision_drift # 1 / sigma_d^2 (eq. 10)
@@ -202,7 +205,7 @@ class COIN:
         self.rho_context = rho_context # self-transition bias (eq. S10)
         self.gamma_cue = gamma_cue # gamma_e (eq. 9)
         self.alpha_cue = alpha_cue # alpha_e (eq. 9)
-        self.infer_bias = infer_bias
+        self.infer_bias = infer_bias # infer context-specific bias in modelling visuomotor learning
         self.prior_precision_bias = prior_precision_bias # 1/sigma_b^2 (eq. 20)
         
         self.perturbations = perturbations
@@ -216,7 +219,7 @@ class COIN:
         self.particles = particles # number of particles
         self.max_contexts = max_contexts # maximum number of contexts that can be instantiated
         
-        self.adaptation = adaptation
+        self.adaptation = adaptation # measured adaptation data
         
         self.store = store
         
@@ -236,14 +239,14 @@ class COIN:
         self.plot_bias = plot_bias
         self.plot_average_bias = plot_average_bias
         self.plot_state_feedback = plot_state_feedback
-        self.plot_explicit_component = plot_explicit_component
+        self.plot_explicit_component = plot_explicit_component # explicit vs implicit learning (Extended figure 9)
         self.plot_implicit_component = plot_implicit_component
-        self.plot_Kalman_gain_given_cstar1 = plot_Kalman_gain_given_cstar1
+        self.plot_Kalman_gain_given_cstar1 = plot_Kalman_gain_given_cstar1 # cstar1 indicates context with highest responsibility
         self.plot_predicted_probability_cstar1 = plot_predicted_probability_cstar1
         self.plot_state_given_cstar1 = plot_state_given_cstar1
-        self.plot_Kalman_gain_given_cstar2 = plot_Kalman_gain_given_cstar2
+        self.plot_Kalman_gain_given_cstar2 = plot_Kalman_gain_given_cstar2 # cstar2 indicates context with higest predicted probability on next trial
         self.plot_state_given_cstar2 = plot_state_given_cstar2
-        self.plot_predicted_probability_cstar3 = plot_predicted_probability_cstar3
+        self.plot_predicted_probability_cstar3 = plot_predicted_probability_cstar3 # cstar3 indicates context with highest predicted probability on current trial
         self.plot_state_given_cstar3 = plot_state_given_cstar3
         
         # for plotting
@@ -259,12 +262,16 @@ class COIN:
         os.makedirs(self.fig_dir, exist_ok=True)
         
         self.sample_crf_stirling = sample_crf_stirling
+        self.simple_sampling = simple_sampling
+        
+    def _worker_main_loop(self, trials: np.ndarray):
+        return self.coin_generative_main_loop(trials)["stored"]
         
     def simulate_coin(self):
+        assert self.perturbations is not None, "perturbations unfound!"
+        
         if self.cues is not None:
             self.cues = check_cue_labels(self.cues, self.perturbations)
-        
-        assert self.perturbations is not None, "perturbations unfound!"
         
         temp = []
         
@@ -282,10 +289,18 @@ class COIN:
             # with multiprocessing.Pool(processes=self.max_cores) as pool:
             #     results = pool.map(parallel_coin_generative_main_loop, range(self.runs))
             # temp = results
-            with trange(self.runs, dynamic_ncols=True) as pbar:
-                for n in pbar:
-                    coin_state = self.coin_generative_main_loop(trials)
-                    temp.append(coin_state["stored"])
+            if self.max_cores > 1:
+                with ProcessPoolExecutor(max_workers=self.max_cores, mp_context=mp.get_context("spawn")) as ex:
+                    temp = list(
+                        ex.map(
+                            self._worker_main_loop, [trials] * self.runs
+                        )
+                    )
+            else:
+                with trange(self.runs, dynamic_ncols=True) as pbar:
+                    for n in pbar:
+                        coin_state = self.coin_generative_main_loop(trials)
+                        temp.append(coin_state["stored"])
 
             w = np.ones(self.runs) / self.runs
             
@@ -420,7 +435,7 @@ class COIN:
         # context transition counts
         coin_state["n_context"] = np.zeros((self.max_contexts + 1, self.max_contexts + 1, self.particles), dtype=int)
         
-        # sampled context
+        # sampled context (use 1-indexing for contexts)
         coin_state["context"] = np.ones((self.particles, ), dtype=int)
         
         # do cues exist?
@@ -439,7 +454,7 @@ class COIN:
         coin_state["dynamics_ss_1"] = np.zeros((self.max_contexts + 1, self.particles, 2))
         coin_state["dynamics_ss_2"] = np.zeros((self.max_contexts + 1, self.particles, 2, 2))
         
-        # sufficient statistics for the parameters of the observation function
+        # sufficient statistics for the parameters of the observation function (if inferring bias)
         coin_state["bias_ss_1"] = np.zeros((self.max_contexts + 1, self.particles))
         coin_state["bias_ss_2"] = np.zeros((self.max_contexts + 1, self.particles))
         
@@ -460,43 +475,44 @@ class COIN:
                 transmat = coin_state["local_transition_matrix"][:C, :C, p]
                 coin_state["prior_probabilities"][:C, p] = stationary_distribution(transmat)
         else:
-            prior_probabilities = np.zeros((self.max_contexts+1, self.particles))
-            
             inds_1 = np.tile(coin_state["context"][None], (self.max_contexts+1, 1)) - 1 # for indexing
             inds_2 = np.tile(np.arange(self.max_contexts+1)[None], (self.particles, 1)).T
             inds_3 = np.tile(np.arange(self.particles)[None], (self.max_contexts+1, 1))
-            for i in range(self.max_contexts+1):
-                for j in range(self.particles):
-                    prior_probabilities[i, j] = coin_state["local_transition_matrix"][
-                        inds_1[i, j], inds_2[i, j], inds_3[i, j], 
-                    ]
             
-            coin_state["prior_probabilities"] = prior_probabilities
-            
-            # TODO: verify if the following vectorised version works
-            
-            # inds_1 = np.tile(coin_state["context"][None], (self.max_contexts+1, 1)).ravel()
-            # inds_2 = np.tile(np.arange(self.max_contexts+1)[:, None], (1, self.particles)).ravel()
-            # inds_3 = np.tile(np.arange(self.particles)[None], (self.max_contexts+1, 1)).ravel()
-
-            # coin_state["prior_probabilities"] = coin_state["local_transition_matrix"][inds_1, inds_2, inds_3].reshape(self.max_contexts+1, self.particles)
+            if self.simple_sampling:
+                coin_state["prior_probabilities"] = coin_state["local_transition_matrix"][inds_1, inds_2, inds_3].reshape(
+                    self.max_contexts+1, self.particles
+                )
+            else:
+                prior_probabilities = np.zeros((self.max_contexts+1, self.particles))
+                for i in range(self.max_contexts+1):
+                    for j in range(self.particles):
+                        prior_probabilities[i, j] = coin_state["local_transition_matrix"][
+                            inds_1[i, j], inds_2[i, j], inds_3[i, j], 
+                        ]
+                
+                coin_state["prior_probabilities"] = prior_probabilities
 
         if coin_state["cues_exist"]:
-            cue_probabilities = np.zeros((self.max_contexts+1, self.particles))
             inds_1 = np.tile(np.arange(self.max_contexts+1)[None], (self.particles, 1)).T
-            inds_2 = np.ones((self.max_contexts+1, self.particles), dtype=int) * self.cues[coin_state["trial"]-1]
+            inds_2 = np.ones((self.max_contexts+1, self.particles), dtype=int) * self.cues[coin_state["trial"]]
             inds_3 = np.tile(np.arange(self.particles)[None], (self.max_contexts+1, 1))
             
-            for i in range(self.max_contexts+1):
-                for j in range(self.particles):
-                    cue_probabilities[i, j] = coin_state["local_cue_matrix"][
+            if self.simple_sampling:
+                coin_state["cue_probabilities"] = coin_state["local_cue_matrix"][inds_1, inds_2, inds_3].reshape(
+                    self.max_contexts+1, self.particles
+                )
+            else:
+                cue_probabilities = np.zeros((self.max_contexts+1, self.particles))
+                for i in range(self.max_contexts+1):
+                    for j in range(self.particles):
+                        cue_probabilities[i, j] = coin_state["local_cue_matrix"][
                         inds_1[i, j], inds_2[i, j], inds_3[i, j], 
                     ]
-            coin_state["cue_probabilities"] = cue_probabilities
+                coin_state["cue_probabilities"] = cue_probabilities
             
             coin_state["predicted_probabilities"] = coin_state["prior_probabilities"] * coin_state["cue_probabilities"]
             coin_state["predicted_probabilities"] = coin_state["predicted_probabilities"] / np.sum(coin_state["predicted_probabilities"], axis=0, keepdims=True)
-        
         else:
             coin_state["predicted_probabilities"] = coin_state["prior_probabilities"]
             
@@ -505,11 +521,7 @@ class COIN:
                 max_inds = np.argmax(coin_state["predicted_probabilities"], axis=0)
                 inds = np.arange(self.particles)
                 
-                assert len(max_inds) == self.particles
-                
-                kalman_gain = np.zeros((self.particles, ))
-                for i in range(self.particles):
-                    kalman_gain[i] = coin_state["Kalman_gains"][max_inds[i], inds[i]]
+                kalman_gain = coin_state["Kalman_gains"][max_inds, inds]
                 coin_state["Kalman_gain_given_cstar2"] = np.mean(kalman_gain)
                     
         if "state_given_cstar2" in self.store:
@@ -517,10 +529,7 @@ class COIN:
                 max_inds = np.argmax(coin_state["predicted_probabilities"], axis=0)
                 inds = np.arange(self.particles)
                 
-                state = np.zeros((self.particles, ))
-                
-                for i in range(len(max_inds)):
-                    state[i] = coin_state["state_mean"][max_inds[i], inds[i]]
+                state = coin_state["state_mean"][max_inds, inds]
                 coin_state["state_given_cstar2"] = np.mean(state)
         
         if "predicted_probability_cstar3" in self.store:
@@ -539,12 +548,11 @@ class COIN:
         inds_2 = np.arange(self.particles)
         
         # novel states are initialised to follow the stationary distribution (under Gaussian LDS)
-        for i in range(self.particles):
-            coin_state["state_mean"][inds_1[i], inds_2[i]] = coin_state["drift"][inds_1[i], inds_2[i]] / (1 - coin_state["retention"][inds_1[i], inds_2[i]])
-            coin_state["state_var"][inds_1[i], inds_2[i]] = np.square(self.sigma_process_noise) / (1 - np.square(coin_state["retention"][inds_1[i], inds_2[i]]))
+        coin_state["state_mean"][inds_1, inds_2] = coin_state["drift"][inds_1, inds_2] / (1 - coin_state["retention"][inds_1, inds_2])
+        coin_state["state_var"][inds_1, inds_2] = np.square(self.sigma_process_noise) / (1 - np.square(coin_state["retention"][inds_1, inds_2]))
         
         # predict state (marginalise over contexts and particles)
-        # mean of the distribution (sum over all contexts and all particles)
+        # mean of state distribution
         coin_state["average_state"] = np.sum(coin_state["predicted_probabilities"] * coin_state["state_mean"]) / self.particles
         
         if "explicit" in self.store:
@@ -554,34 +562,28 @@ class COIN:
             else:
                 max_inds = np.argmax(coin_state["responsibilities"], axis=0)
                 inds = np.arange(self.particles)
-                state_mean = np.zeros((self.particles, ))
-                for i in range(self.particles):
-                    state_mean[i] = coin_state["state_mean"][max_inds[i], inds[i]]
+                state_mean = coin_state["state_mean"][max_inds, inds]
                 coin_state["explicit"] = np.mean(state_mean)
         
         if "state_given_cstar3" in self.store:
             # given posterior predictive distribution.
             max_inds = np.argmax(coin_state["predicted_probabilities"], axis=0)
             inds = np.arange(self.particles)
-            state_mean = np.zeros((self.particles, ))
-            for i in range(self.particles):
-                state_mean[i] = coin_state["state_mean"][max_inds[i], inds[i]]
+            state_mean = coin_state["state_mean"][max_inds, inds]
             coin_state["state_given_cstar3"] = np.mean(state_mean)
         
         return coin_state
     
     def predict_state_feedback(self, coin_state: Dict[str, Any]):
         # predict state feedback for each context (potential non-trivial context-specific bias term in visuo-motor tasks) (eq. 19)
+        coin_state["state_feedback_mean"] = coin_state["state_mean"]
         if "bias" in coin_state:
-            coin_state["state_feedback_mean"] = coin_state["state_mean"] + coin_state["bias"]
-        else:
-            coin_state["state_feedback_mean"] = coin_state["state_mean"]
+            coin_state["state_feedback_mean"] += coin_state["bias"]
         
         # variance of state feedback prediction for each context
+        coin_state["state_feedback_var"] = coin_state["state_var"] + np.square(coin_state["sigma_observation_noise"])
         if "bias" in coin_state:
-            coin_state["state_feedback_var"] = coin_state["state_var"] + np.square(coin_state["sigma_observation_noise"]) + 1 / self.prior_precision_bias # (eq. 19)
-        else:
-            coin_state["state_feedback_var"] = coin_state["state_var"] + np.square(coin_state["sigma_observation_noise"]) # (eq. 19)
+            coin_state["state_feedback_var"] += 1 / self.prior_precision_bias # (eq. 19)
         
         coin_state = self.compute_marginal_distribution(coin_state)
         
@@ -605,25 +607,19 @@ class COIN:
         return coin_state
     
     def resample_particles(self, coin_state: Dict[str, Any]):
-        # p(y_t|c_t)
+        # p(y_t|x_t, c_t)
         coin_state["probability_state_feedback"] = norm(coin_state["state_feedback_mean"], np.sqrt(coin_state["state_feedback_var"])).pdf(coin_state["state_feedback"])
         
         if coin_state["feedback_observed"][coin_state["trial"]]:
+            p_c = np.log(coin_state["prior_probabilities"]) + np.log(coin_state["probability_state_feedback"])
             if coin_state["cues_exist"]:
-                # log p(y_t, q_t, c_t)
-                p_c = np.log(coin_state["prior_probabilities"]) + np.log(coin_state["cue_probabilities"]) + np.log(coin_state["probability_state_feedback"])
-            else:
-                # log p(y_t, c_t)
-                p_c = np.log(coin_state["prior_probabilities"]) + np.log(coin_state["probability_state_feedback"])
+                p_c += np.log(coin_state["cue_probabilities"])
         else:
+            p_c = np.log(coin_state["prior_probabilities"])
             if coin_state["cues_exist"]:
-                # log p(q_t, c_t)
-                p_c = np.log(coin_state["prior_probabilities"]) + np.log(coin_state["probability_cue"])
-            else:
-                # log p(c_t)
-                p_c = np.log(coin_state["prior_probabilities"])
+                p_c += np.log(coin_state["cue_probabilities"])
         
-        log_weights = log_sum_exp(p_c) # log p(y_t, q_t) (marginalise out contexts)
+        log_weights = log_sum_exp(p_c, axis=0) # log p(y_t, q_t) (marginalise out contexts)
 
         p_c = p_c - log_weights # log p(c_t|y_t, q_t)
         
@@ -707,15 +703,15 @@ class COIN:
         coin_state["global_transition_probabilities"][inds, p_beta_x] = coin_state["global_transition_probabilities"][inds, p_beta_x] * sb_weight
         
         if coin_state["cues_exist"]:
-            if self.cues[coin_state["trial"]-1] > coin_state["Q"]:
+            if self.cues[coin_state["trial"]] > coin_state["Q"]:
                 # increment the cue context count
                 coin_state["Q"] += 1
                 
                 # sample the next stick-breaking weight
                 sb_weight = np.random.beta(1, self.gamma_cue * np.ones((self.particles, )))
                 
-                coin_state["global_cue_probabilities"][coin_state["Q"], :] = coin_state["global_cue_probabilities"][coin_state["Q"]-1, :] * (1 - sb_weight)
-                coin_state["global_cue_probabilities"][coin_state["Q"]-1, :] = coin_state["global_cue_probabilities"][coin_state["Q"]-1, :] * sb_weight
+                coin_state["global_cue_probabilities"][coin_state["Q"], np.arange(self.particles)] = coin_state["global_cue_probabilities"][coin_state["Q"]-1, np.arange(self.particles)] * (1 - sb_weight)
+                coin_state["global_cue_probabilities"][coin_state["Q"]-1, np.arange(self.particles)] = coin_state["global_cue_probabilities"][coin_state["Q"]-1, np.arange(self.particles)] * sb_weight
                 
         return coin_state
     
@@ -793,8 +789,8 @@ class COIN:
             coin_state["predicted_probability_cstar1"] = np.mean(coin_state["predicted_probabilities"][max_inds, np.arange(self.particles)], axis=0)
         
         if "state_given_cstar1" in self.store:
-            max_inds = np.max(coin_state["responsibilities"], axis=0)
-            coin_state["state_given_cstar"] = np.mean(coin_state["state_mean"][max_inds, np.arange(self.particles)], axis=0)
+            max_inds = np.argmax(coin_state["responsibilities"], axis=0)
+            coin_state["state_given_cstar1"] = np.mean(coin_state["state_mean"][max_inds, np.arange(self.particles)], axis=0)
         
         variables_stored_before_resampling = [
             "predicted_probabilities", 
@@ -855,8 +851,7 @@ class COIN:
                     coin_state["n_context"], # (max_contexts+1, max_contexts+1, particles)
                 )
             
-            
-            # sample the number of tables in restaurant i considering dish j
+            # sample the number of tables in restaurant i *considering* dish j
             m_context_bar = coin_state["m_context"].astype(float)
             
             if self.rho_context > 0:
@@ -878,22 +873,28 @@ class COIN:
                 inds_2 = inds_2[non_zero_inds_1, non_zero_inds_2]
                 inds_3 = inds_3[non_zero_inds_1, non_zero_inds_2]
                 
-                # m_context_bar[inds_1, inds_2, inds_3] = coin_state["m_context"][inds_1, inds_2, inds_3] - \
-                #     random_binomial(p, coin_state["m_context"][inds_1, inds_2, inds_3])
-                m_context_bar[inds_1, inds_2, inds_3] = coin_state["m_context"][inds_1, inds_2, inds_3] - \
-                    np.random.binomial(coin_state["m_context"][inds_1, inds_2, inds_3], p)
-            
+                # removing loyal customers
+                if self.simple_sampling:
+                    m_context_bar[inds_1, inds_2, inds_3] = coin_state["m_context"][inds_1, inds_2, inds_3] - \
+                        np.random.binomial(coin_state["m_context"][inds_1, inds_2, inds_3], p)
+                else:
+                    m_context_bar[inds_1, inds_2, inds_3] = coin_state["m_context"][inds_1, inds_2, inds_3] - \
+                        random_binomial(p, coin_state["m_context"][inds_1, inds_2, inds_3])
+
             # handling boundary condition
             m_context_bar[0, 0, m_context_bar[0, 0, :] == 0] = 1
             
-            # sample beta
+            # posterior sampling of beta
             inds = np.where(coin_state["C"] != self.max_contexts)[0]
             inds_C = coin_state["C"][inds] # + 1
             global_transition_posterior_dirichlet_param = np.sum(m_context_bar, axis=0)
             for i in range(len(inds)):
                 global_transition_posterior_dirichlet_param[inds_C[i], inds[i]] = self.gamma_context
             
-            coin_state["global_transition_probabilities"] = random_dirichlet(global_transition_posterior_dirichlet_param)
+            if self.simple_sampling:
+                coin_state["global_transition_probabilities"] = random_dirichlet_fast(global_transition_posterior_dirichlet_param)
+            else:
+                coin_state["global_transition_probabilities"] = random_dirichlet(global_transition_posterior_dirichlet_param)
 
         return coin_state
     
@@ -911,16 +912,19 @@ class COIN:
                     coin_state["n_cue"], 
                 )
             else:
-                coin_state["m_cue"] = sample_num_tables_CRF(
+                coin_state["m_cue"], _, _, _ = sample_num_tables_CRF(
                     np.tile(self.alpha_cue * coin_state["global_cue_probabilities"][None], (self.max_contexts+1, 1, 1)), 
                     coin_state["n_cue"], 
                 )
             
             # sample beta_e
-            coin_state["global_cue_posterior"] = np.reshape(np.sum(coin_state["m_cue"], axis=0), (self.cues+1, self.particles))
-            coin_state["global_cue_posterior"][coin_state["Q"]+1, :] = self.gamma_cue
+            coin_state["global_cue_posterior"] = np.reshape(np.sum(coin_state["m_cue"], axis=0), (np.max(self.cues)+1, self.particles))
+            coin_state["global_cue_posterior"][coin_state["Q"]+1, np.arange(self.particles)] = self.gamma_cue
             
-            coin_state["global_cue_probabilities"] = random_dirichlet(coin_state["global_cue_posterior"])
+            if self.simple_sampling:
+                coin_state["global_cue_probabilities"] = random_dirichlet_fast(coin_state["global_cue_posterior"])
+            else:
+                coin_state["global_cue_probabilities"] = random_dirichlet(coin_state["global_cue_posterior"])
         
         return coin_state
     
@@ -955,7 +959,9 @@ class COIN:
             self.alpha_cue * coin_state["global_cue_probabilities"], 
             (1, np.max(self.cues) + 1, self.particles)
         ) + coin_state["n_cue"]
-        coin_state["local_cue_matrix"] = coin_state["local_cue_matrix"] / np.sum(coin_state["local_cue_matrix"], axis=0, keepdims=True)
+        coin_state["local_cue_matrix"] = coin_state["local_cue_matrix"] / np.sum(
+            coin_state["local_cue_matrix"], axis=1, keepdims=True, 
+        )
         
         zero_mass_contexts = (np.reshape(coin_state["global_transition_probabilities"], (self.max_contexts+1, 1, self.particles)) > 0)
         coin_state["local_cue_matrix"] = coin_state["local_cue_matrix"] * zero_mass_contexts
@@ -972,7 +978,10 @@ class COIN:
         # update the parameters of the posterior
         coin_state["dynamics_covariance"] = per_slice_invert(
             dynamics_lambda[..., None] + 
-            np.transpose(np.reshape(coin_state["dynamics_ss_2"], ((self.max_contexts+1)*self.particles, 2, 2)), (1, 2, 0)) / (self.sigma_process_noise ** 2)
+            np.transpose(np.reshape(
+                coin_state["dynamics_ss_2"], 
+                ((self.max_contexts+1)*self.particles, 2, 2)
+            ), (1, 2, 0)) / (self.sigma_process_noise ** 2)
         )
         coin_state["dynamics_mean"] = per_slice_multiply(
             coin_state["dynamics_covariance"], 
@@ -1058,18 +1067,16 @@ class COIN:
         inds_2 = coin_state["context"] -1 # TODO: is the -1 right?
         inds_3 = np.arange(self.particles)
         
-        for i in range(self.particles):
-            coin_state["n_context"][inds_1[i], inds_2[i], inds_3[i]] = coin_state["n_context"][inds_1[i], inds_2[i], inds_3[i]] + 1
+        coin_state["n_context"][inds_1, inds_2, inds_3] += 1
 
         return coin_state
     
     def update_sufficient_statistics_global_cue_probabilities(self, coin_state: Dict[str, Any]):
         inds_1 = coin_state["context"] - 1 # TODO: is the -1 right?
-        inds_2 = self.cues[coin_state["trial"]] * np.ones((self.particles, ))
+        inds_2 = np.full((self.particles,), int(self.cues[coin_state["trial"]]), dtype=int)
         inds_3 = np.arange(self.particles)
-        
-        for i in range(self.particles):
-            coin_state["n_cue"][inds_1[i], inds_2[i], inds_3[i]] = coin_state["n_cue"][inds_1[i], inds_2[i], inds_3[i]] + 1
+
+        coin_state["n_cue"][inds_1, inds_2, inds_3] += 1
 
         return coin_state
     
@@ -1107,26 +1114,26 @@ class COIN:
         if self.plot_stationary_probabilities:
             temp.append("stationary_probabilities")
         if self.plot_retention_given_context:
-            temp.extend(["dynamics_mean", "dynamics_covar"])
+            temp.extend(["dynamics_mean", "dynamics_covariance"])
         if self.plot_drift_given_context:
-            temp.extend(["dynamics_mean", "dynamics_covar"])
+            temp.extend(["dynamics_mean", "dynamics_covariance"])
         if self.plot_bias_given_context:
             if self.infer_bias:
                 temp.extend(["bias_mean", "bias_var"])
             else:
-                raise ValueError
+                raise ValueError("You must set the flag 'infer_bias' to True in order to plot bias given context.")
         if self.plot_global_transition_probabilities:
             temp.append("global_transition_probabilities")
         if self.plot_local_transition_probabilities:
             temp.append("local_transition_probabilities")
         if self.plot_local_cue_probabilities:
             if self.cues is None or len(self.cues) == 0:
-                raise ValueError
+                raise ValueError("Experiments must have sensory cues to plot local cue probabilities.")
             else:
                 temp.append("local_cue_matrix")
         if self.plot_global_cue_probabilities:
             if self.cues is None or len(self.cues) == 0:
-                raise ValueError
+                raise ValueError("Experiments must have sensory cues to plot global cue probabilities.")
             else:
                 temp.append("global_cue_posterior")
         if self.plot_state:
@@ -1137,7 +1144,7 @@ class COIN:
             if self.infer_bias:
                 temp.extend(["bias_distribution", "implicit"])
             else:
-                raise ValueError
+                raise ValueError("You must set the flag 'infer_bias' to True in order to plot bias.")
         if self.plot_average_bias:
             temp.append("implicit")
         if self.plot_state_feedback:
@@ -1172,7 +1179,7 @@ class COIN:
         variables_requiring_context_relabelling = [
             "state_given_context", 
             "predicted_probabilities", 
-            "responsibilties", 
+            "responsibilities", 
             "stationary_probabilities", 
             "retention_given_context", 
             "drift_given_context", 
@@ -1255,12 +1262,8 @@ class COIN:
                     inds_3 = np.tile(np.arange(n_perms)[None, None], [n_sequences, n_sequences, 1])
                     
                     H_new = np.zeros((n_sequences, n_sequences, n_perms))
-                    
-                    for ii in range(n_sequences):
-                        for jj in range(n_sequences):
-                            for kk in range(n_perms):
-                                H_new[ii, jj, kk] = H[inds_1[ii, jj, kk], inds_2[ii, jj, kk], inds_3[ii, jj, kk]]
-                    
+                    H_new[inds_1, inds_2, inds_3] = H[inds_1, inds_2, inds_3]
+
                     H = H_new.copy()
                     
                     # recursively update Hamming distances
@@ -1317,13 +1320,14 @@ class COIN:
     def context_sequence(self, S: Dict[str, Any], inds_resampled: np.ndarray):
         num_trials = len(self.perturbations)
         
-        context_seq = {}
+        context_seq = {
+            i: np.zeros((self.particles * self.runs, i+1), dtype=int) 
+            for i in range(num_trials)
+        }
         
         for n in range(self.runs):
             p = self.particles * n + np.arange(self.particles)
             for i in range(num_trials):
-                if n == 0:
-                    context_seq[i] = np.zeros((self.particles * self.runs, i+1), dtype=int)
                 if i > 0:
                     context_seq[i][p, :i] = context_seq[i-1][p, :]
                     context_seq[i][p, :] = context_seq[i][inds_resampled[p, i], :]
@@ -1334,7 +1338,7 @@ class COIN:
     def posterior_number_of_contexts(self, context_sequence: Dict[int, Any], S: Dict[str, Any]):
         num_trials = len(self.perturbations)
         
-        # number of contexts
+        # number of contexts per particle per run
         C = np.zeros((self.particles * self.runs, num_trials), dtype=int)
         for n in range(self.runs):
             p = self.particles * n + np.arange(self.particles)
@@ -1425,16 +1429,16 @@ class COIN:
 
         mode_number_of_contexts = P["mode_number_of_contexts"].astype(int)
         if self.plot_state_given_context:
-            P["state_given_context"] = np.ones(
-                (self.state_values.size, num_trials, np.max(mode_number_of_contexts)+1, self.runs)
-            ) * np.nan
+            P["state_given_context"] = np.full(
+                (self.state_values.size, num_trials, np.max(mode_number_of_contexts)+1, self.runs), np.nan
+            )
         if self.plot_predicted_probabilities:
-            P["predicted_probabilities"] = np.ones((num_trials, np.max(mode_number_of_contexts)+1, self.runs)) * np.nan
+            P["predicted_probabilities"] = np.full((num_trials, np.max(mode_number_of_contexts)+1, self.runs), np.nan)
             P["predicted_probabilities"][0, -1, :] = 1
         if self.plot_responsibilities:
-            P["responsibilities"] = np.ones((num_trials, np.max(mode_number_of_contexts)+1, self.runs)) * np.nan
+            P["responsibilities"] = np.full((num_trials, np.max(mode_number_of_contexts)+1, self.runs), np.nan)
         if self.plot_stationary_probabilities:
-            P["stationary_probabilities"] = np.ones((num_trials, np.max(mode_number_of_contexts)+1, self.runs)) * np.nan
+            P["stationary_probabilities"] = np.full((num_trials, np.max(mode_number_of_contexts)+1, self.runs), np.nan)
         if self.plot_retention_given_context:
             P["retention_given_context"] = np.zeros(
                 (self.retention_values.size, num_trials, np.max(mode_number_of_contexts), self.runs)
@@ -1448,47 +1452,47 @@ class COIN:
                 (self.bias_values.size, num_trials, np.max(mode_number_of_contexts), self.runs)
             )
         if self.plot_global_transition_probabilities:
-            P["global_transition_probabilities"] = np.ones((num_trials, np.max(mode_number_of_contexts)+1, self.runs)) * np.nan
+            P["global_transition_probabilities"] = np.full((num_trials, np.max(mode_number_of_contexts)+1, self.runs), np.nan)
         if self.plot_local_transition_probabilities:
-            P["local_transition_probabilities"] = np.ones(
-                (np.max(mode_number_of_contexts), np.max(mode_number_of_contexts)+1, num_trials, self.runs)
-            ) * np.nan
+            P["local_transition_probabilities"] = np.full(
+                (np.max(mode_number_of_contexts), np.max(mode_number_of_contexts)+1, num_trials, self.runs), np.nan
+            )
         if self.plot_global_cue_probabilities:
-            P["global_cue_probabilities"] = np.ones((num_trials, np.max(self.cues)+1, self.runs)) * np.nan
+            P["global_cue_probabilities"] = np.full((num_trials, np.max(self.cues)+1, self.runs), np.nan)
         if self.plot_local_cue_probabilities:
-            P["local_cue_probabilities"] = np.ones(
-                (np.max(mode_number_of_contexts), np.max(self.cues)+1, num_trials, self.runs)
-            ) * np.nan
+            P["local_cue_probabilities"] = np.full(
+                (np.max(mode_number_of_contexts), np.max(self.cues)+1, num_trials, self.runs), np.nan
+            )
         if self.plot_state:
-            P["state"] = np.ones((self.state_values.size, num_trials, self.runs)) * np.nan
+            P["state"] = np.full((self.state_values.size, num_trials, self.runs), np.nan)
         if self.plot_average_state or self.plot_state:
-            P["average_state"] = np.ones((num_trials, self.runs)) * np.nan
+            P["average_state"] = np.full((num_trials, self.runs), np.nan)
         if self.plot_bias:
-            P["bias"] = np.ones((self.bias_values.size, num_trials, self.runs)) * np.nan
+            P["bias"] = np.full((self.bias_values.size, num_trials, self.runs), np.nan)
         if self.plot_average_bias or self.plot_bias:
-            P["average_bias"] = np.ones((num_trials, self.runs)) * np.nan
+            P["average_bias"] = np.full((num_trials, self.runs), np.nan)
         if self.plot_state_feedback:
-            P["state_feedback"] = np.ones((self.state_feedback_values.size, num_trials, self.runs)) * np.nan
+            P["state_feedback"] = np.full((self.state_feedback_values.size, num_trials, self.runs), np.nan)
         if self.plot_explicit_component:
-            P["explicit_component"] = np.ones((num_trials, self.runs)) * np.nan
+            P["explicit_component"] = np.full((num_trials, self.runs), np.nan)
         if self.plot_implicit_component:
-            P["implicit_component"] = np.ones((num_trials, self.runs)) * np.nan
+            P["implicit_component"] = np.full((num_trials, self.runs), np.nan)
         if self.plot_Kalman_gain_given_cstar1:
-            P["Kalman_gain_given_cstar1"] = np.ones((num_trials, self.runs)) * np.nan
+            P["Kalman_gain_given_cstar1"] = np.full((num_trials, self.runs), np.nan)
         if self.plot_predicted_probability_cstar1:
-            P["predicted_probability_cstar1"] = np.ones((num_trials, self.runs)) * np.nan
+            P["predicted_probability_cstar1"] = np.full((num_trials, self.runs), np.nan)
         if self.plot_state_given_cstar1:
-            P["state_given_cstar1"] = np.ones((num_trials, self.runs)) * np.nan
+            P["state_given_cstar1"] = np.full((num_trials, self.runs), np.nan)
         if self.plot_Kalman_gain_given_cstar2:
-            P["Kalman_gain_given_cstar2"] = np.ones((num_trials, self.runs)) * np.nan
+            P["Kalman_gain_given_cstar2"] = np.full((num_trials, self.runs), np.nan)
         if self.plot_state_given_cstar2:
-            P["state_given_cstar2"] = np.ones((num_trials, self.runs)) * np.nan
+            P["state_given_cstar2"] = np.full((num_trials, self.runs), np.nan)
         if self.plot_predicted_probability_cstar3:
-            P["predicted_probability_cstar3"] = np.ones((num_trials, self.runs)) * np.nan
+            P["predicted_probability_cstar3"] = np.full((num_trials, self.runs), np.nan)
         if self.plot_state_given_cstar3:
-            P["state_given_cstar3"] = np.ones((num_trials, self.runs)) * np.nan
-        P["average_state_feedback"] = np.ones((num_trials, self.runs)) * np.nan
-    
+            P["state_given_cstar3"] = np.full((num_trials, self.runs), np.nan)
+        P["average_state_feedback"] = np.full((num_trials, self.runs), np.nan)
+
         return P
 
     def relabel_context_variables(
@@ -1548,9 +1552,7 @@ class COIN:
         inds_2 = np.tile(np.concatenate([inds_map, np.array([C+1])])[None], [C, 1])
         
         permuted_transmat = np.zeros_like(transmat)
-        for i in range(C):
-            for j in range(C+1):
-                permuted_transmat[i, j] = transmat[inds_1[i], inds_2[j]]
+        permuted_transmat[inds_1, inds_2] = transmat[inds_1, inds_2]
         
         return permuted_transmat
     
@@ -1570,8 +1572,8 @@ class COIN:
         # predictive distributions
         if trial < (num_trials - 1):
             if self.plot_state_given_context:
-                mu = np.transpose(S["runs"][run]["state_mean"][:(C+1), particles, trial+1][..., None], [2, 1, 0])
-                sd = np.transpose(np.sqrt(S["runs"][run]["state_var"][:(C+1), particles, trial+1][..., None]), [2, 1, 0])
+                mu = np.transpose(S["runs"][run]["state_mean"][:(C+1), particles, [trial+1]], [2, 1, 0])
+                sd = np.transpose(np.sqrt(S["runs"][run]["state_var"][:(C+1), particles, [trial+1]]), [2, 1, 0])
                 # TODO: check the dimensions!
                 P["state_given_context"][:, trial+1, np.concatenate([np.arange(C), np.array([novel_context])-1]), run] = \
                     np.sum(norm(mu, sd).pdf(self.state_values[:, None, None]), axis=1)
@@ -1584,31 +1586,31 @@ class COIN:
                 self.sum_along_dimension(S["runs"][run]["responsibilities"][:(C+1), particles, trial], axis=1)
         if self.plot_stationary_probabilities:
             P["stationary_probabilities"][trial, np.concatenate([np.arange(C), np.array([novel_context])-1]), run] = \
-                np.sum(S["runs"][run]["stationary_probabilities"][:(C+1), particles, trial], axis=1, keepdims=True)
+                np.sum(S["runs"][run]["stationary_probabilities"][:(C+1), particles, trial], axis=1)
         if self.plot_retention_given_context:
             # TODO: verify the dimensions!
-            mu = np.transpose(S["runs"][run]["dynamics_mean"][0, :C, particles, trial], [1, 0])
-            std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][0, 0, :C, particles, trial]), [1, 0])
-            P["retention_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.retention_values), axis=1, keepdims=True)
+            mu = np.transpose(S["runs"][run]["dynamics_mean"][0, :C, particles, [trial]], [2, 1, 0])
+            std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][0, 0, :C, particles, [trial]])[..., None], [2, 1, 0])
+            P["retention_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.retention_values), axis=1)
         if self.plot_drift_given_context:
-            mu = np.transpose(S["runs"][run]["dynamics_mean"][1, :C, particles, trial], [1, 0])
-            std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][1, 1, :C, particles, trial]), [1, 0])
-            P["drift_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.drift_values), axis=1, keepdims=True)
+            mu = np.transpose(S["runs"][run]["dynamics_mean"][1, :C, particles, [trial]], [2, 1, 0])
+            std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][1, 1, :C, particles, [trial]])[..., None], [2, 1, 0])
+            P["drift_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.drift_values), axis=1)
         if self.plot_bias_given_context:
-            mu = np.transpose(S["runs"][run]["bias_mean"][:C, particles, trial], [1, 0])
-            std = np.transpose(np.sqrt(S["runs"][run]["bias_var"][:C, particles, trial]), [1, 0])
-            P["bias_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.bias_values), axis=1, keepdims=True)
+            mu = np.transpose(S["runs"][run]["bias_mean"][:C, particles, [trial]], [2, 1, 0])
+            std = np.transpose(np.sqrt(S["runs"][run]["bias_var"][:C, particles, [trial]]), [2, 1, 0])
+            P["bias_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.bias_values), axis=1)
         if self.plot_global_transition_probabilities:
             alpha = S["runs"][run]["global_transition_posterior"][:(C+1), particles, trial]
             P["global_transition_probabilities"][trial, np.concatenate([np.arange(C), np.array([novel_context])]), run] = \
-                np.sum(alpha / np.sum(alpha, axis=0, keepdims=True), axis=1, keepdims=True)
+                np.sum(alpha / np.sum(alpha, axis=0, keepdims=True), axis=1)
         if self.plot_local_transition_probabilities:
             P["local_transition_probabilities"][:C, np.concatenate([np.arange(C), np.array([novel_context])]), trial, run] = \
-                np.sum(S["runs"][run]["local_transition_matrix"][:C, :(C+1), particles, trial], axis=2, keepdims=True)
+                np.sum(S["runs"][run]["local_transition_matrix"][:C, :(C+1), particles, trial], axis=2)
         if self.plot_local_cue_probabilities:
             P["local_cue_probabilities"][
                 :C, np.concatenate([np.arange(np.max(self.cues[:trial])), np.array([np.max(self.cues)+1])]), trial, run
-            ] = np.sum(S["runs"][run]["local_cue_matrix"][:C, :(np.max(self.cues[:trial])+1), particles, trial], axis=2, keepdims=True)
+            ] = np.sum(S["runs"][run]["local_cue_matrix"][:C, :(np.max(self.cues[:trial])+1), particles, trial], axis=2)
         
         return P
     
@@ -1716,7 +1718,9 @@ class COIN:
     
     def weighted_sum_along_dimension(self, X: np.ndarray, S: Dict[str, Any], dim: int):
         nan_inds = np.all(np.isnan(X), axis=dim)
-        X = np.nansum(X * np.reshape(S["weights"], [1] * (dim-1) + [S["weights"].size]), axis=dim)
+        shape = [1] * X.ndim
+        shape[dim] = S["weights"].size
+        X = np.nansum(X * np.reshape(S["weights"], shape), axis=dim)
         X[nan_inds] = np.nan
         
         return X
@@ -1764,9 +1768,7 @@ class COIN:
         font_size = 15
         
         num_trials = len(self.perturbations)
-        
-        if not os.path.exists(self.fig_dir):
-            os.makedirs(self.fig_dir)
+        os.makedirs(self.fig_dir, exist_ok=True)
         
         if self.plot_state_given_context:
             fig, ax = plt.subplots(1, 2, figsize=(12, 5))

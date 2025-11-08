@@ -1201,6 +1201,7 @@ class COIN:
                 P = self.integrate_over_runs(P, S)
         
         self.generate_figures(P)
+        return P
 
     def find_optimal_context_labels(self, S: Dict[str, Any]):
         inds_resampled = self.resample_inds(S)
@@ -1214,7 +1215,7 @@ class COIN:
         # flipping 
         L = np.array(list(permutations(np.arange(1, np.max(mode_number_of_contexts)+1)))[::-1])
         L = np.transpose(L[None], (2, 0, 1)) # (C, 1, C!)
-        n_perms = factorial(np.max(mode_number_of_contexts)) # + 1) # TODO: do we need +1?
+        n_perms = factorial(int(np.max(mode_number_of_contexts))) # + 1) # TODO: do we need +1?
         
         num_trials = len(self.perturbations)
         
@@ -1261,8 +1262,7 @@ class COIN:
                     inds_2 = np.tile(parent[None, :, None], [n_sequences, 1, n_perms])
                     inds_3 = np.tile(np.arange(n_perms)[None, None], [n_sequences, n_sequences, 1])
                     
-                    H_new = np.zeros((n_sequences, n_sequences, n_perms))
-                    H_new[inds_1, inds_2, inds_3] = H[inds_1, inds_2, inds_3]
+                    H_new = H[inds_1, inds_2, inds_3]
 
                     H = H_new.copy()
                     
@@ -1572,8 +1572,8 @@ class COIN:
         # predictive distributions
         if trial < (num_trials - 1):
             if self.plot_state_given_context:
-                mu = np.transpose(S["runs"][run]["state_mean"][:(C+1), particles, [trial+1]], [2, 1, 0])
-                sd = np.transpose(np.sqrt(S["runs"][run]["state_var"][:(C+1), particles, [trial+1]]), [2, 1, 0])
+                mu = np.transpose(S["runs"][run]["state_mean"][:(C+1), particles, trial+1][..., None], [2, 1, 0])
+                sd = np.transpose(np.sqrt(S["runs"][run]["state_var"][:(C+1), particles, trial+1][..., None]), [2, 1, 0])
                 # TODO: check the dimensions!
                 P["state_given_context"][:, trial+1, np.concatenate([np.arange(C), np.array([novel_context])-1]), run] = \
                     np.sum(norm(mu, sd).pdf(self.state_values[:, None, None]), axis=1)
@@ -1589,16 +1589,16 @@ class COIN:
                 np.sum(S["runs"][run]["stationary_probabilities"][:(C+1), particles, trial], axis=1)
         if self.plot_retention_given_context:
             # TODO: verify the dimensions!
-            mu = np.transpose(S["runs"][run]["dynamics_mean"][0, :C, particles, [trial]], [2, 1, 0])
-            std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][0, 0, :C, particles, [trial]])[..., None], [2, 1, 0])
+            mu = np.transpose(S["runs"][run]["dynamics_mean"][0, :C, particles, trial][..., None], [2, 1, 0])
+            std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][0, 0, :C, particles, trial][..., None])[..., None], [2, 1, 0])
             P["retention_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.retention_values), axis=1)
         if self.plot_drift_given_context:
-            mu = np.transpose(S["runs"][run]["dynamics_mean"][1, :C, particles, [trial]], [2, 1, 0])
-            std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][1, 1, :C, particles, [trial]])[..., None], [2, 1, 0])
+            mu = np.transpose(S["runs"][run]["dynamics_mean"][1, :C, particles, trial][..., None], [2, 1, 0])
+            std = np.transpose(np.sqrt(S["runs"][run]["dynamics_mean"][1, 1, :C, particles, trial][..., None]), [2, 1, 0])
             P["drift_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.drift_values), axis=1)
         if self.plot_bias_given_context:
-            mu = np.transpose(S["runs"][run]["bias_mean"][:C, particles, [trial]], [2, 1, 0])
-            std = np.transpose(np.sqrt(S["runs"][run]["bias_var"][:C, particles, [trial]]), [2, 1, 0])
+            mu = np.transpose(S["runs"][run]["bias_mean"][:C, particles, trial][..., None], [2, 1, 0])
+            std = np.transpose(np.sqrt(S["runs"][run]["bias_var"][:C, particles, trial][..., None]), [2, 1, 0])
             P["bias_given_context"][:, trial, :C, run] = np.sum(norm(mu, std).pdf(self.bias_values), axis=1)
         if self.plot_global_transition_probabilities:
             alpha = S["runs"][run]["global_transition_posterior"][:(C+1), particles, trial]

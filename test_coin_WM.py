@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 
 from coin import COIN
 
+import time
+
 
 def main():
     retention_values = np.linspace(0.8, 1, 500, endpoint=True)
@@ -20,7 +22,8 @@ def main():
         store=["state_feedback", "motor_output"],
         sample_crf_stirling=False,  # use default parameters for now
         simple_sampling=True, 
-        max_cores=4, 
+        max_cores=10, 
+        particles=1000, 
     )
     coin.perturbations = np.concatenate([
         np.zeros((192, )), 
@@ -36,8 +39,9 @@ def main():
     
     # deal with this later
     # coin.stationary_trials = 597
-    
+    t0 = time.time()
     output = coin.simulate_coin()
+    print(f"{time.time() - t0:.2f}s")
 
     return output
 
